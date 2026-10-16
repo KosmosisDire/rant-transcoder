@@ -52,6 +52,8 @@ endforeach()
 if(NOT WIN32)
   set(CMAKE_BUILD_RPATH "$ORIGIN")
   set(CMAKE_INSTALL_RPATH "$ORIGIN")
+  # an RPATH, unlike a RUNPATH, also serves the libraries' own needs, such as avcodec's swresample
+  add_link_options("LINKER:--disable-new-dtags")
 endif()
 
 function(ffmpeg_copy_runtime dir)

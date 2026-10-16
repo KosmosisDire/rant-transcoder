@@ -18,6 +18,8 @@ target_link_libraries(rant_transcoder_core PUBLIC rant_impl
 target_compile_definitions(rant_transcoder_core PUBLIC RANT_TRANSCODER_VERSION="${PROJECT_VERSION}")
 if(WIN32)
   target_link_libraries(rant_transcoder_core PUBLIC iphlpapi ws2_32)
+else()
+  target_link_libraries(rant_transcoder_core PUBLIC ${CMAKE_DL_LIBS})
 endif()
 if(MSVC)
   target_compile_options(rant_transcoder_core PRIVATE /W4 /permissive-)

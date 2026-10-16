@@ -7,6 +7,10 @@
 #include <map>
 #include <mutex>
 
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
+
 extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
@@ -31,8 +35,27 @@ const AVHWDeviceType kDevices[] = {
 #endif
 };
 
+/* VAAPI, which Quick Sync also runs on under Linux, is usable. The FFmpeg build binds libva
+ * lazily and aborts the process when a call finds it missing, so look before asking. */
+bool have_vaapi() {
+#ifdef __linux__
+    static const bool ok = [] {
+        for (const char* lib : { "libva.so.2", "libva-drm.so.2" }) {
+            void* h = dlopen(lib, RTLD_LAZY | RTLD_LOCAL);
+            if (!h) return false;
+            dlclose(h);
+        }
+        return true;
+    }();
+    return ok;
+#else
+    return true;
+#endif
+}
+
 /* One device per type for the whole process, null when the machine has none. */
 AVBufferRef* device(AVHWDeviceType type) {
+    if (type == AV_HWDEVICE_TYPE_VAAPI && !have_vaapi()) return nullptr;
     static std::mutex mu;
     static std::map<AVHWDeviceType, AVBufferRef*> made;
     std::lock_guard<std::mutex> g(mu);
@@ -332,6 +355,9 @@ bool Encoder::open(int width, int height, double fps, const std::string& only) {
     for (const std::string& name : names) {
         const AVCodec* codec = avcodec_find_encoder_by_name(name.c_str());
         if (!codec) continue;
+#ifdef __linux__
+        if (name == "h264_qsv" && !have_vaapi()) continue;
+#endif
         AVCodecContext* ctx = avcodec_alloc_context3(codec);
         ctx->width = width;
         ctx->height = height;
