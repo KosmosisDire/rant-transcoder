@@ -1,0 +1,10 @@
+# CMake build trees, the built exes and the FFmpeg libraries copied beside them
+/build/
+/bin/
+
+# Editor and OS files
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
