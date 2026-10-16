@@ -140,12 +140,12 @@ public:
         int r = avformat_open_input(&fmt_, url.c_str(), in, &o);
         av_dict_free(&o);
         if (r < 0) {
-            error = av_error(r);
+            error = why(r);
             return false;   /* the failed open freed the context */
         }
         deadline_ = steady_clock::now() + seconds(10);
         if ((r = avformat_find_stream_info(fmt_, nullptr)) < 0) {
-            error = av_error(r);
+            error = why(r);
             return false;
         }
         index_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
@@ -201,7 +201,14 @@ public:
 private:
     static int interrupted(void* self) {
         auto* s = static_cast<UrlSource*>(self);
-        return s->stop_->load() || steady_clock::now() > s->deadline_;
+        if (s->stop_->load()) return 1;
+        s->timed_out_ = steady_clock::now() > s->deadline_;
+        return s->timed_out_;
+    }
+
+    /* FFmpeg reports our own deadline as an exit request, which says nothing to a reader. */
+    std::string why(int code) const {
+        return timed_out_ ? "no answer within 10 s" : av_error(code);
     }
 
     bool end() {
@@ -250,6 +257,7 @@ private:
     int index_ = -1;
     double fps_ = 0;
     bool ended_ = false;
+    bool timed_out_ = false;
     bool anchored_ = false;
     uint64_t anchor_ = 0;
     int64_t base_ = 0;

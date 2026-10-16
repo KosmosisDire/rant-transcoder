@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace transcoder {
@@ -29,6 +30,8 @@ private:
     void scan();
 
     Options options_;
+    std::mutex told_mu_;   /* before the node, so they outlive its event handler */
+    std::map<std::string, std::chrono::steady_clock::time_point> told_;
     rant::Node node_;
     std::map<std::string, std::unique_ptr<Stream>> streams_;
     uint32_t epoch_ = 0;

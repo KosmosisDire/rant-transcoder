@@ -18,6 +18,7 @@ rant::NodeOptions node_options(const Options& o) {
     n.fetch_details = true;   /* schemas tell an Image from any other topic */
     n.max_topics = 512;       /* up to five per stream: two children, the parent, a descriptor */
     n.max_peers = 256;
+    n.disable_logs = true;    /* it logs to stdout, and the log topics of a peer on an older Rant never match */
     return n;
 }
 
@@ -41,7 +42,20 @@ bool origin_of(const rant::Entity& e, Origin& out) {
 
 }
 
-Transcoder::Transcoder(const Options& options) : options_(options), node_(options.name, node_options(options)) {}
+Transcoder::Transcoder(const Options& options) : options_(options), node_(options.name, node_options(options)) {
+    /* Rant repeats an error for as long as its cause lasts, so each line shows once a minute */
+    node_.on_event([this](const rant::Event& e) {
+        if (!e.is_error()) return;
+        std::string text = e.to_string();
+        auto now = steady_clock::now();
+        std::lock_guard<std::mutex> g(told_mu_);
+        if (told_.size() > 1000) told_.clear();
+        auto it = told_.find(text);
+        if (it != told_.end() && now - it->second < minutes(1)) return;
+        told_[text] = now;
+        say("rant: %s", text.c_str());
+    });
+}
 
 void Transcoder::scan() {
     rant::Reflection r = node_.reflection();
