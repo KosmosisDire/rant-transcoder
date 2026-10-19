@@ -15,6 +15,7 @@ namespace {
 rant::NodeOptions node_options(const Options& o) {
     rant::NodeOptions n;
     n.domain = o.domain;
+    n.multicast_interface = o.interface;
     n.fetch_details = true;   /* schemas tell an Image from any other topic */
     n.max_topics = 512;       /* up to five per stream: two children, the parent, a descriptor */
     n.max_peers = 256;

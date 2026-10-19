@@ -17,6 +17,7 @@ struct Options {
     uint16_t domain = 0;                 /* 0 takes RANT_DOMAIN */
     std::string name = "transcoder";     /* every transcoder's node is skipped as a source */
     std::string encoder;                 /* one FFmpeg encoder to use, empty = the best that opens */
+    std::string interface;               /* the multicast interface, empty = all, "127.0.0.1" = this host only */
 };
 
 /* Watches the mesh for video published on this host and keeps a Stream for each. */

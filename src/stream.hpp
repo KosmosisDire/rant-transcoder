@@ -23,9 +23,9 @@ struct Parent {
     bool operator==(const Parent& o) const { return name == o.name && origin == o.origin && peer == o.peer; }
 };
 
-/* A parent and its children: Parent/Video at the source's own size and rate, and
- * Parent/Preview when needs_preview says so. A worker thread runs only while a child has a
- * subscriber, apart from a short probe that measures the source. */
+/* A parent and the children that change it: Parent/Video at the source's own size and rate
+ * unless the parent is an H264 topic already, Parent/Preview when it would be smaller. A
+ * worker runs only while a child has a subscriber, apart from a probe that measures the source. */
 class Stream {
 public:
     Stream(rant::Node& node, Parent parent, std::string encoder);
@@ -44,7 +44,8 @@ private:
     void run();
     bool external() const { return parent_.origin == Origin::StreamTopic || parent_.origin == Origin::StreamVariable; }
     void set_descriptor(const rant::types::ExternalVideoStream& d);
-    void measured(int width, int height, double fps);
+    void measured(int width, int height, double fps, bool h264);
+    void child(rant::Publisher<rant::types::VideoFrame>& pub, bool need, const char* suffix);
     int matches(bool preview);
     void publish(bool preview, const uint8_t* data, size_t size, bool key, int width, int height, uint64_t time_us);
 
@@ -52,11 +53,13 @@ private:
     Parent parent_;
     std::string encoder_;
 
-    std::mutex mu_;   /* guards the children, the shape and the descriptor */
+    bool skip_ = false;   /* the name leaves no room for a child's */
+    std::mutex mu_;       /* guards the children, the shape and the descriptor */
     rant::Publisher<rant::types::VideoFrame> video_;
     rant::Publisher<rant::types::VideoFrame> preview_;
     int width_ = 0, height_ = 0;
     double fps_ = 0;
+    bool h264_ = false;
     std::string url_;
     rant::types::VideoStreamKind kind_ = rant::types::VideoStreamKind::Rtsp;
     std::atomic<uint32_t> descriptor_gen_{ 0 };

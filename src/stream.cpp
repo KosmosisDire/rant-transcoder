@@ -46,10 +46,12 @@ Stream::Stream(rant::Node& node, Parent parent, std::string encoder)
     : node_(node), parent_(std::move(parent)), encoder_(std::move(encoder)) {
     if (parent_.name.size() + std::char_traits<char>::length("/Preview") > kNameMax) {
         say("%s: the name is too long to add /Video and /Preview, skipped", parent_.name.c_str());
+        skip_ = true;
         return;
     }
     try {
-        video_ = node_.publisher<VideoFrame>(parent_.name + "/Video");
+        /* pictures and URLs always change on the way to Video, a VideoFrame topic waits for its codec */
+        if (parent_.origin != Origin::VideoFrame) video_ = node_.publisher<VideoFrame>(parent_.name + "/Video");
         if (parent_.origin == Origin::StreamVariable) {
             descriptor_var_ = node_.remote_variable<ExternalVideoStream>(parent_.name);
             descriptor_var_.on_change([this](const ExternalVideoStream& d) { set_descriptor(d); });
@@ -71,7 +73,7 @@ Stream::~Stream() {
 }
 
 void Stream::tick() {
-    if (!video_.valid()) return;
+    if (skip_) return;
     if (parent_.origin == Origin::StreamTopic)
         if (auto d = descriptor_topic_.take_latest()) set_descriptor(*d);
     if (descriptor_gen_ != seen_gen_) {   /* a new URL is probed at once */
@@ -134,28 +136,37 @@ int Stream::matches(bool preview) {
     return pub.valid() ? pub.match_count() : 0;
 }
 
-void Stream::measured(int width, int height, double fps) {
+void Stream::child(rant::Publisher<VideoFrame>& pub, bool need, const char* suffix) {
+    if (need == pub.valid()) return;
+    if (!need) {
+        pub = {};
+        return;
+    }
+    try {
+        pub = node_.publisher<VideoFrame>(parent_.name + suffix);
+    } catch (const rant::Error& e) {
+        say("%s%s: %s", parent_.name.c_str(), suffix, e.what());
+    }
+}
+
+void Stream::measured(int width, int height, double fps, bool h264) {
     std::lock_guard<std::mutex> g(mu_);
-    bool changed = width != width_ || height != height_ || std::abs(fps - fps_) > fps_ * 0.2;
+    bool changed = width != width_ || height != height_ || h264 != h264_ || std::abs(fps - fps_) > fps_ * 0.2;
     width_ = width;
     height_ = height;
     fps_ = fps;
-    bool need = needs_preview(width, height, fps);
-    if (need && !preview_.valid()) {
-        try {
-            preview_ = node_.publisher<VideoFrame>(parent_.name + "/Preview");
-            say("%s: %dx%d at %.1f fps, with a preview", parent_.name.c_str(), width, height, fps);
-        } catch (const rant::Error& e) {
-            say("%s/Preview: %s", parent_.name.c_str(), e.what());
-        }
-    } else if (!need && preview_.valid() && preview_.match_count() == 0) {
-        /* a watched preview stays, since a busy worker undercounts a raw source's rate */
-        preview_ = {};
-        say("%s: %dx%d at %.1f fps, no preview needed", parent_.name.c_str(), width, height, fps);
-    } else if (changed) {
-        say("%s: %dx%d at %.1f fps%s", parent_.name.c_str(), width, height, fps,
-            need ? ", with a preview" : ", no preview needed");
-    }
+    h264_ = h264;
+    /* a copy of what is on the mesh already changes nothing, so it is never published */
+    bool video = parent_.origin != Origin::VideoFrame || !h264;
+    bool preview = needs_preview(width, height);
+    child(video_, video, "/Video");
+    child(preview_, preview, "/Preview");
+    if (!changed) return;
+    const char* children = video && preview ? "republished as Video and Preview"
+                         : video            ? "republished as Video"
+                         : preview          ? "republished as Preview"
+                                            : "nothing to republish";
+    say("%s: %dx%d at %.1f fps%s, %s", parent_.name.c_str(), width, height, fps, h264 ? " H264" : "", children);
 }
 
 void Stream::publish(bool preview, const uint8_t* data, size_t size, bool key, int width, int height,
@@ -182,13 +193,14 @@ void Stream::run() {
     bool synced = false;            /* the decoder started on a keyframe and missed nothing since */
     bool told_open = false, told_decode = false;
     int width = 0, height = 0;      /* the latest picture size, decoded or stated */
+    bool h264 = false;              /* the source arrives as H264 */
     auto began = Clock::now(), last_measure = began;
 
     auto rate = [&] { return meter.count() >= 2 ? meter.fps() : src ? src->stated_fps() : 0.0; };
 
     while (!stop_) {
         if (probing_ && Clock::now() - began > seconds(3)) {
-            if (width > 0) measured(width, height, rate());
+            if (width > 0) measured(width, height, rate(), h264);
             probing_ = false;
             if (matches(false) == 0 && matches(true) == 0) break;
         }
@@ -235,8 +247,9 @@ void Stream::run() {
         }
         double fps = rate() > 0 ? rate() : 30.0;
 
+        h264 = !u.picture && u.codec == AV_CODEC_ID_H264;
         bool video = matches(false) > 0, preview = matches(true) > 0;
-        bool pass = !u.picture && u.codec == AV_CODEC_ID_H264;   /* H264 already: Video is the same bytes */
+        bool pass = h264;   /* only a URL has a Video then, which carries the same bytes onto the mesh */
         if (video && pass) publish(false, u.data, u.size, u.key, width, height, u.time_us);
 
         auto encode = [&](const AVFrame* pic, bool to_video) {
@@ -278,7 +291,7 @@ void Stream::run() {
         }
 
         if (!probing_ && width > 0 && Clock::now() - last_measure > seconds(2)) {
-            measured(width, height, rate());
+            measured(width, height, rate(), h264);
             last_measure = Clock::now();
         }
     }

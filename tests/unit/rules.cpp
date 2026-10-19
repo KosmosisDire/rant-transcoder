@@ -17,14 +17,13 @@ static int gated(double fps, int n) {
 }
 
 int main() {
-    /* a preview only for a source bigger than 720p or faster than 24 fps */
-    CHECK(needs_preview(1920, 1080, 30));
-    CHECK(needs_preview(1920, 1080, 10));
-    CHECK(needs_preview(1280, 720, 60));
-    CHECK(needs_preview(640, 480, 30));
-    CHECK(!needs_preview(1280, 720, 24));
-    CHECK(!needs_preview(1280, 720, 25));
-    CHECK(!needs_preview(640, 480, 20));
+    /* a preview only when it would be smaller than the source */
+    CHECK(needs_preview(1920, 1080));
+    CHECK(needs_preview(1440, 1080));
+    CHECK(needs_preview(1080, 1920));
+    CHECK(needs_preview(1281, 720));
+    CHECK(!needs_preview(1280, 720));
+    CHECK(!needs_preview(640, 480));
 
     int w = 0, h = 0;
     preview_size(1920, 1080, w, h);

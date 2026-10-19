@@ -5,8 +5,8 @@
 
 namespace transcoder {
 
-bool needs_preview(int width, int height, double fps) {
-    return width > kPreviewWidth || height > kPreviewHeight || fps > kPreviewFps * 1.1;
+bool needs_preview(int width, int height) {
+    return width > kPreviewWidth || height > kPreviewHeight;
 }
 
 void preview_size(int width, int height, int& out_width, int& out_height) {

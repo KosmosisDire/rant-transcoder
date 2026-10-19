@@ -34,11 +34,13 @@ static void on_signal(int) { g_stop = true; }
 #endif
 
 static void usage() {
-    std::printf("usage: rant-transcoder [--domain N] [--encoder NAME] [--verbose]\n"
+    std::printf("usage: rant-transcoder [--domain N] [--encoder NAME] [--interface IP] [--verbose]\n"
                 "       rant-transcoder --version\n"
-                "Republishes the video on this host's Rant nodes as H264: Parent/Video at the source's\n"
-                "size and rate, Parent/Preview at 720p and 24 fps when the source is bigger or faster.\n"
-                "--encoder forces one FFmpeg encoder, such as h264_nvenc or libopenh264.\n");
+                "Republishes the video on this host's Rant nodes as H264, only where that changes it:\n"
+                "Parent/Video at the source's size and rate unless the source is H264 on the mesh\n"
+                "already, Parent/Preview at 720p and 24 fps when the source is bigger than 720p.\n"
+                "--encoder forces one FFmpeg encoder, such as h264_nvenc or libopenh264.\n"
+                "--interface joins the mesh on one interface only, 127.0.0.1 for this host alone.\n");
 }
 
 int main(int argc, char** argv) {
@@ -55,6 +57,7 @@ int main(int argc, char** argv) {
         };
         if (a == "--domain") o.domain = uint16_t(std::atoi(value()));
         else if (a == "--encoder") o.encoder = value();
+        else if (a == "--interface") o.interface = value();
         else if (a == "--verbose") verbose = true;
         else if (a == "--version") {
             std::printf("rant-transcoder %s\n", RANT_TRANSCODER_VERSION);

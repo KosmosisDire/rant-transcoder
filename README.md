@@ -1,7 +1,8 @@
 # rant-transcoder
 
-Republishes the video on this host's Rant nodes as H264 that any viewer can play:
-`Parent/Video` at the source's size and rate, `Parent/Preview` at 720p and 24 fps.
+Republishes the video on this host's Rant nodes as H264 that any viewer can play, only
+where that changes it: `Parent/Video` unless the source is H264 on the mesh already,
+`Parent/Preview` at 720p and 24 fps when the source is bigger than 720p.
 
 ```
 rant-transcoder --domain 7
