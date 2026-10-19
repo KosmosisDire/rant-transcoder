@@ -27,7 +27,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/get_cpm.cmake")
 # A release pins the newest Rant. The local presets set CPM_rant_SOURCE to ../rant.
 CPMAddPackage(NAME rant
   GITHUB_REPOSITORY KosmosisDire/Rant
-  VERSION 0.0.25
+  VERSION 0.0.31
   EXCLUDE_FROM_ALL YES
   SYSTEM YES)
 
