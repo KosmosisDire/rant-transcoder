@@ -14,6 +14,9 @@ pub struct Frame {
 // SAFETY: a frame belongs to whoever holds it, FFmpeg keeps no hidden thread ties
 unsafe impl Send for Frame {}
 
+// SAFETY: a shared frame is only read, and FFmpeg counts buffer references atomically
+unsafe impl Sync for Frame {}
+
 impl Frame {
     pub fn new() -> Frame {
         // SAFETY: a plain allocation, null only when memory runs out
@@ -110,6 +113,66 @@ impl Drop for Frame {
         let mut p = self.ptr.as_ptr();
         // SAFETY: the frame is ours alone
         unsafe { ffi::av_frame_free(&mut p) };
+    }
+}
+
+/// Reused buffers for frames that must outlive the pixels they came from.
+#[derive(Default)]
+pub struct Pool {
+    pool: Option<NonNull<ffi::AVBufferPool>>,
+    /// The picture the buffers fit.
+    fits: Option<(u32, u32, PixelFormat)>,
+}
+
+// SAFETY: FFmpeg's pools lock themselves
+unsafe impl Send for Pool {}
+
+/// Rows start on this many bytes, which the scaler's vector code reads fastest.
+const ALIGN: c_int = 64;
+
+impl Pool {
+    /// A frame of its own with `src`'s picture: another reference to counted buffers, or a
+    /// copy of borrowed pixels in a buffer of the pool. None when memory runs out.
+    pub fn own(&mut self, src: &Frame) -> Option<Frame> {
+        let mut f = Frame::new();
+        // SAFETY: both frames are valid and the new one is empty. A pooled buffer is as big as
+        // av_image_get_buffer_size says the picture needs, and pointed into as it says
+        unsafe {
+            if !src.raw().buf[0].is_null() {
+                return (ffi::av_frame_ref(f.as_mut_ptr(), src.as_ptr()) >= 0).then_some(f);
+            }
+            let (w, h, format) = (src.width(), src.height(), src.format());
+            if self.fits != Some((w, h, format)) {
+                self.drop_pool();
+                let size = ffi::av_image_get_buffer_size(format.0, w as c_int, h as c_int, ALIGN);
+                self.pool = NonNull::new(ffi::av_buffer_pool_init(usize::try_from(size).ok()?, None));
+                self.fits = self.pool.and(Some((w, h, format)));
+            }
+            let buf = ffi::av_buffer_pool_get(self.pool?.as_ptr());
+            if buf.is_null() {
+                return None;
+            }
+            let r = f.ptr.as_mut();
+            r.buf[0] = buf;
+            (r.width, r.height, r.format) = (w as c_int, h as c_int, format.0);
+            ffi::av_image_fill_arrays(r.data.as_mut_ptr(), r.linesize.as_mut_ptr(), (*buf).data, format.0, r.width, r.height, ALIGN);
+            r.extended_data = r.data.as_mut_ptr();
+            (ffi::av_frame_copy(r, src.as_ptr()) >= 0 && ffi::av_frame_copy_props(r, src.as_ptr()) >= 0).then_some(f)
+        }
+    }
+
+    fn drop_pool(&mut self) {
+        if let Some(p) = self.pool.take() {
+            let mut p = p.as_ptr();
+            // SAFETY: FFmpeg frees the pool once every buffer it lent is back
+            unsafe { ffi::av_buffer_pool_uninit(&mut p) };
+        }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.drop_pool();
     }
 }
 

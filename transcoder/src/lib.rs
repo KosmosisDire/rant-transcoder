@@ -3,6 +3,7 @@
 
 pub mod annexb;
 pub mod av;
+mod child;
 pub mod hosts;
 pub mod rules;
 pub mod source;

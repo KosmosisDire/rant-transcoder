@@ -11,7 +11,7 @@ mod scaler;
 pub use color::Colors;
 pub use decoder::Decoder;
 pub use encoder::Encoder;
-pub use frame::{Frame, Layout, Wrapped};
+pub use frame::{Frame, Layout, Pool, Wrapped};
 pub use input::{Input, InputPacket};
 pub use scaler::Scaler;
 
