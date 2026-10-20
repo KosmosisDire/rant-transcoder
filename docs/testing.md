@@ -41,3 +41,7 @@ target/release/rant-transcoder --domain 151 --interface 127.0.0.1
 
 The bench makes its clips first and prints "watching" when its sources start. Measure after
 that, once the children have settled.
+
+On a CPU with performance and efficiency cores, pin the transcoder to the performance cores
+and the bench to the others. Unpinned, the same build measured 0.46 to 0.82 cores in five runs
+on an i9-13900HX, pinned 0.37 to 0.39.
