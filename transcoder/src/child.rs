@@ -9,7 +9,7 @@ use rant::types::{VideoCodec, VideoFrame};
 use tracing::{info, warn};
 
 use crate::av::{Output, Picture};
-use crate::rules::{PREVIEW_FPS, RateGate, preview_size};
+use crate::rules::{PREVIEW_FPS, RateGate, preview_size, video_size};
 use crate::stream::{Flags, Shared, publish};
 
 /// A picture for a child, with the source's rate when it came.
@@ -121,7 +121,8 @@ impl Encoding {
             let (w, h) = preview_size(width, height);
             (w, h, job.fps.min(PREVIEW_FPS))
         } else {
-            (width, height, job.fps)
+            let (w, h) = video_size(width, height);
+            (w, h, job.fps)
         };
         if !self.ready(p, w, h, fps) {
             return;

@@ -116,3 +116,32 @@ impl Output {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::av::{CodecId, Decoder, Layout, Pool};
+    use crate::rules::video_size;
+
+    #[test]
+    fn every_video_size_encodes() {
+        for (w, h) in [(1921, 1081), (7680, 4320), (8, 6)] {
+            let pixels = vec![128u8; w * h];
+            let mut raw = Frame::new();
+            let wrapped = raw.wrap(&pixels, Layout { width: w as u32, height: h as u32, stride: 0, format: PixelFormat::GRAY8 }).unwrap();
+            let picture = Picture::new(Pool::default().own(&wrapped).unwrap());
+            let (vw, vh) = video_size(w as u32, h as u32);
+            let mut o = Output::open(&picture, vw, vh, 30.0, None, &[]).unwrap_or_else(|| panic!("{vw}x{vh} opens"));
+            let mut units = Vec::new();
+            for i in 0..3 {
+                assert!(o.encode(&picture, i * 33_000, i == 0, |data, _| units.push(data.to_vec())), "{} encodes {vw}x{vh}", o.describe());
+            }
+            let mut d = Decoder::software(CodecId::H264, None).unwrap();
+            let mut size = None;
+            for u in &units {
+                d.decode(u, |f| size = size.or(Some((f.width(), f.height()))));
+            }
+            assert_eq!(size, Some((vw, vh)), "{w}x{h} through {}", o.describe());
+        }
+    }
+}

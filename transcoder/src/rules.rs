@@ -1,4 +1,4 @@
-//! When a preview exists, its size, and the rates both children are judged by.
+//! Each child's size, when a preview exists, and the rates both children are judged by.
 
 use std::collections::VecDeque;
 
@@ -6,6 +6,31 @@ use std::collections::VecDeque;
 pub const PREVIEW_WIDTH: u32 = 1280;
 pub const PREVIEW_HEIGHT: u32 = 720;
 pub const PREVIEW_FPS: f64 = 24.0;
+
+/// H264's largest picture at level 5.2, the most players are held to decode: 4096 a side and
+/// 36864 blocks of 16x16, which 4096x2304 fills.
+pub const H264_MAX_SIDE: u32 = 4096;
+pub const H264_MAX_BLOCKS: u32 = 36864;
+
+/// The smallest side every encoder takes: one block. openh264, the last tried, needs it.
+pub const H264_MIN_SIDE: u32 = 16;
+
+/// Video keeps its source's size with both sides even, grown to one block a side or shrunk to
+/// fit H264's largest picture.
+pub fn video_size(width: u32, height: u32) -> (u32, u32) {
+    let (wf, hf) = (width.max(1) as f64, height.max(1) as f64);
+    let side = H264_MAX_SIDE as f64;
+    let up = (H264_MIN_SIDE as f64 / wf.min(hf)).max(1.0);
+    let mut s = up.min(side / wf).min(side / hf).min((H264_MAX_BLOCKS as f64 * 256.0 / (wf * hf)).sqrt());
+    loop {
+        let even = |v: f64| ((v * s).round() as u32 & !1).max(H264_MIN_SIDE);
+        let (w, h) = (even(wf), even(hf));
+        if w <= H264_MAX_SIDE && h <= H264_MAX_SIDE && w.div_ceil(16) * h.div_ceil(16) <= H264_MAX_BLOCKS {
+            return (w, h);
+        }
+        s *= 0.995;
+    }
+}
 
 /// A preview exists only when it would be smaller than its source.
 pub fn needs_preview(width: u32, height: u32) -> bool {
@@ -91,6 +116,23 @@ mod tests {
         assert!(needs_preview(1281, 720));
         assert!(!needs_preview(1280, 720));
         assert!(!needs_preview(640, 480));
+    }
+
+    #[test]
+    fn video_is_even_and_fits_h264() {
+        assert_eq!(video_size(1920, 1080), (1920, 1080));
+        assert_eq!(video_size(1921, 1081), (1920, 1080));
+        assert_eq!(video_size(7680, 4320), (4096, 2304));
+        assert_eq!(video_size(4096, 4096), (3072, 3072));
+        assert_eq!(video_size(8192, 1024), (4096, 512));
+        assert_eq!(video_size(1, 1), (16, 16));
+        assert_eq!(video_size(8, 6), (20, 16));
+        assert_eq!(video_size(32, 24), (32, 24));
+        for (w, h) in [(5000, 3000), (4097, 2305), (3000, 9000), (12345, 678), (3, 100_000)] {
+            let (vw, vh) = video_size(w, h);
+            assert!(vw % 2 == 0 && vh % 2 == 0 && (16..=4096).contains(&vw) && (16..=4096).contains(&vh), "{w}x{h} gives {vw}x{vh}");
+            assert!(vw.div_ceil(16) * vh.div_ceil(16) <= H264_MAX_BLOCKS, "{w}x{h} gives {vw}x{vh}");
+        }
     }
 
     #[test]
