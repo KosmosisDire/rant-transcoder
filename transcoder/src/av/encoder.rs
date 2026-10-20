@@ -2,7 +2,7 @@ use std::ffi::{CString, c_void};
 use std::os::raw::c_int;
 
 use super::hw::{self, Frames, Kind};
-use super::{Colors, Dict, Frame, Packet, PixelFormat, static_text};
+use super::{Colors, Dict, Error, Frame, Packet, PixelFormat, static_text};
 use crate::annexb::ParameterSets;
 use crate::ffi;
 
@@ -164,8 +164,8 @@ impl Encoder {
     }
 
     /// Encodes a picture at the encoder's size and format. `keyframe` forces an IDR. `out`
-    /// gets each access unit in Annex B and whether it is a keyframe.
-    pub(super) fn encode(&mut self, picture: &mut Frame, time_us: u64, keyframe: bool, mut out: impl FnMut(&[u8], bool)) {
+    /// gets each access unit in Annex B and whether it is a keyframe. False when it fails.
+    pub(super) fn encode(&mut self, picture: &mut Frame, time_us: u64, keyframe: bool, mut out: impl FnMut(&[u8], bool)) -> bool {
         let pts = (time_us as i64).max(self.last_pts.saturating_add(1));
         self.last_pts = pts;
         // SAFETY: the picture is ours to stamp, and each packet is ours between receive and unref
@@ -174,9 +174,13 @@ impl Encoder {
             p.pts = pts;
             p.pict_type = if keyframe { ffi::AV_PICTURE_TYPE_I } else { ffi::AV_PICTURE_TYPE_NONE };
             if ffi::avcodec_send_frame(self.ctx, p) < 0 {
-                return;
+                return false;
             }
-            while ffi::avcodec_receive_packet(self.ctx, self.packet.as_ptr()) == 0 {
+            loop {
+                let r = ffi::avcodec_receive_packet(self.ctx, self.packet.as_ptr());
+                if r < 0 {
+                    return Error(r) == Error::AGAIN || Error(r) == Error::EOF;
+                }
                 let key = self.packet.raw().flags & ffi::AV_PKT_FLAG_KEY as c_int != 0;
                 out(&self.params.complete(self.packet.data(), key), key);
                 self.packet.unref();

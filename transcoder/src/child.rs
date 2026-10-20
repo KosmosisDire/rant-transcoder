@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use rant::types::{VideoCodec, VideoFrame};
 use tracing::{info, warn};
@@ -46,6 +47,8 @@ impl Child {
             shared,
             flags,
             output: None,
+            errors: 0,
+            refused: Vec::new(),
             failed: None,
             gate: preview.then(|| RateGate::new(PREVIEW_FPS)),
             out: VideoFrame { codec: VideoCodec::H264, ..VideoFrame::default() },
@@ -80,8 +83,12 @@ struct Encoding {
     shared: Arc<Mutex<Shared>>,
     flags: Arc<Flags>,
     output: Option<Output>,
-    /// The size no encoder opened at, not retried.
-    failed: Option<(u32, u32)>,
+    /// Pictures the output failed in a row.
+    errors: u32,
+    /// Encoders that kept failing, left out until a minute has passed.
+    refused: Vec<(&'static str, Instant)>,
+    /// The size no encoder opened at, and when, so it waits before the next try.
+    failed: Option<((u32, u32), Instant)>,
     gate: Option<RateGate>,
     /// The reused outgoing message.
     out: VideoFrame,
@@ -121,7 +128,17 @@ impl Encoding {
         }
         let Some(o) = &mut self.output else { return };
         let (shared, out, preview, t) = (&self.shared, &mut self.out, self.preview, job.time_us);
-        o.encode(p, t, self.flags.take_key(preview), |data, key| publish(shared, out, preview, data, key, w, h, t));
+        if o.encode(p, t, self.flags.take_key(preview), |data, key| publish(shared, out, preview, data, key, w, h, t)) {
+            self.errors = 0;
+            return;
+        }
+        // an encoder that opens yet fails every picture gives way to the next
+        self.errors += 1;
+        if self.errors >= 30 {
+            warn!("{}: {} keeps failing, trying the next encoder", self.name, o.describe());
+            self.refused.push((o.encoder(), Instant::now()));
+            (self.output, self.errors) = (None, 0);
+        }
     }
 
     /// Opens the output for pictures like this one at a size when it is not open for them already.
@@ -129,16 +146,26 @@ impl Encoding {
         if self.output.as_ref().is_some_and(|o| o.fits(picture, width, height)) {
             return true;
         }
-        if self.failed == Some((width, height)) {
+        let now = Instant::now();
+        let size = (width, height);
+        // a full NVENC or a busy device may free up, so a failed size is tried again
+        if self.failed.is_some_and(|(s, at)| s == size && now - at < Duration::from_secs(10)) {
             return false;
         }
+        self.refused.retain(|(_, at)| now - *at < Duration::from_secs(60));
+        let refused: Vec<&str> = self.refused.iter().map(|(name, _)| *name).collect();
         self.output = None; // a GeForce counts the open sessions
-        self.output = Output::open(picture, width, height, fps, self.only.as_deref());
+        self.output = Output::open(picture, width, height, fps, self.only.as_deref(), &refused);
         match &self.output {
-            Some(o) => info!("{}: {width}x{height} at {fps:.1} fps with {}", self.name, o.describe()),
+            Some(o) => {
+                info!("{}: {width}x{height} at {fps:.1} fps with {}", self.name, o.describe());
+                self.failed = None;
+            }
             None => {
-                self.failed = Some((width, height));
-                warn!("{}: no H264 encoder opens at {width}x{height}", self.name);
+                if self.failed.is_none_or(|(s, _)| s != size) {
+                    warn!("{}: no H264 encoder opens at {width}x{height}", self.name);
+                }
+                self.failed = Some((size, now));
             }
         }
         self.output.is_some()

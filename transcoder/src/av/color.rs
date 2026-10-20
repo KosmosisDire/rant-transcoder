@@ -106,7 +106,7 @@ mod tests {
     fn encode(o: &mut Output, p: &Picture) -> Vec<Vec<u8>> {
         let mut units = Vec::new();
         for i in 0..5 {
-            o.encode(p, i * 40_000, i == 0, |data, _| units.push(data.to_vec()));
+            assert!(o.encode(p, i * 40_000, i == 0, |data, _| units.push(data.to_vec())), "{} encodes", o.describe());
         }
         units
     }
@@ -133,7 +133,7 @@ mod tests {
         let mut raw = Frame::new();
         let wrapped = raw.wrap(&pixels, Layout { width: W as u32, height: H as u32, stride: 0, format: PixelFormat::GRAY8 }).unwrap();
         let picture = Picture::new(Pool::default().own(&wrapped).unwrap());
-        let h264 = encode(&mut Output::open(&picture, W as u32, H as u32, 25.0, None).unwrap(), &picture);
+        let h264 = encode(&mut Output::open(&picture, W as u32, H as u32, 25.0, None, &[]).unwrap(), &picture);
 
         for (source, codec, units) in [("jpeg", CodecId::MJPEG, vec![black_and_white()]), ("h264", CodecId::H264, h264)] {
             let decoders = [Decoder::software(codec, None), Decoder::open(codec, None, None), Decoder::open(codec, None, Some("h264_qsv"))];
@@ -145,7 +145,7 @@ mod tests {
                 tried.push(d.describe());
                 let picture = first(&mut d, &units).unwrap_or_else(|| panic!("{} decodes {source}", d.describe()));
                 for only in std::iter::once(None).chain(ORDER.iter().map(|s| Some(s.name))) {
-                    let Some(mut o) = Output::open(&picture, W as u32, H as u32, 25.0, only) else { continue };
+                    let Some(mut o) = Output::open(&picture, W as u32, H as u32, 25.0, only, &[]) else { continue };
                     let path = format!("{source} through {} into {}", d.describe(), o.describe());
                     eprintln!("{path}");
                     let (range, got) = seen(&encode(&mut o, &picture)).unwrap_or_else(|| panic!("{path}: the H264 decodes"));

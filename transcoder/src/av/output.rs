@@ -28,8 +28,9 @@ enum Path {
 
 impl Output {
     /// Opens for pictures like `picture` at a size, with the first encoder that opens, or only
-    /// the one named. None when none does.
-    pub fn open(picture: &Picture, width: u32, height: u32, fps: f64, only: Option<&str>) -> Option<Output> {
+    /// the one named, and none of those `refused`. None when none does.
+    pub fn open(picture: &Picture, width: u32, height: u32, fps: f64, only: Option<&str>, refused: &[&str]) -> Option<Output> {
+        let specs = || encoder::specs(only).filter(|s| !refused.contains(&s.name));
         let f = picture.frame();
         let colors = Colors::for_child(f);
         let on_device = f.on_device();
@@ -37,7 +38,7 @@ impl Output {
         // a device's pictures stay there with the first encoder that takes them in place
         if let Some(device) = hw::device_of(f) {
             let full = f.raw().color_range == ffi::AVCOL_RANGE_JPEG;
-            for spec in encoder::specs(only) {
+            for spec in specs() {
                 let Some((kind, chain)) = spec.device.filter(|(k, _)| k.kind == device) else { continue };
                 let filter = match Filter::new(f, &chain(width, height, full)) {
                     Ok(filter) => filter,
@@ -51,7 +52,7 @@ impl Output {
                 }
             }
         }
-        for spec in encoder::specs(only) {
+        for spec in specs() {
             match spec.device {
                 Some((kind, _)) if spec.device_only => {
                     let Some(pool) = hw::device(kind).and_then(|d| Frames::new(d, width, height)) else { continue };
@@ -80,27 +81,30 @@ impl Output {
     }
 
     /// Encodes a picture. `keyframe` forces an IDR. `out` gets each access unit in Annex B and
-    /// whether it is a keyframe.
-    pub fn encode(&mut self, picture: &Picture, time_us: u64, keyframe: bool, mut out: impl FnMut(&[u8], bool)) {
+    /// whether it is a keyframe. False when the picture does not reach the encoder or the
+    /// encoder fails.
+    pub fn encode(&mut self, picture: &Picture, time_us: u64, keyframe: bool, mut out: impl FnMut(&[u8], bool)) -> bool {
         let e = &mut self.encoder;
         let (w, h, colors) = (e.width(), e.height(), e.colors());
         match &mut self.path {
             Path::Device(filter, _) => {
-                filter.run(picture.frame(), |f: &mut Frame| e.encode(f, time_us, keyframe, &mut out));
+                let mut ok = true;
+                filter.run(picture.frame(), |f: &mut Frame| ok &= e.encode(f, time_us, keyframe, &mut out)) && ok
             }
             Path::System(scaler) => {
                 let format = e.format();
-                if let Some(f) = picture.system().and_then(|src| scaler.convert(src, w, h, format, colors)) {
-                    e.encode(f, time_us, keyframe, out);
-                }
+                picture.system().and_then(|src| scaler.convert(src, w, h, format, colors)).is_some_and(|f| e.encode(f, time_us, keyframe, out))
             }
             Path::Upload(scaler, pool, _) => {
                 let nv12 = picture.system().and_then(|src| scaler.convert(src, w, h, PixelFormat::NV12, colors));
-                if let Some(mut f) = nv12.and_then(|f| pool.upload(f)) {
-                    e.encode(&mut f, time_us, keyframe, out);
-                }
+                nv12.and_then(|f| pool.upload(f)).is_some_and(|mut f| e.encode(&mut f, time_us, keyframe, out))
             }
         }
+    }
+
+    /// The encoder's own name, such as h264_nvenc.
+    pub fn encoder(&self) -> &'static str {
+        self.encoder.name()
     }
 
     /// The encoder's name, and the device when it takes pictures there.
