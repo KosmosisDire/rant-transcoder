@@ -85,8 +85,9 @@ fn generate(include: &Path, stubs: &Path) -> Result<String, bindgen::BindgenErro
         .clang_arg(format!("-I{}", include.display()))
         .allowlist_function("(av|avcodec|avfilter|avformat|avio|avutil|sws|swscale)_.*")
         .allowlist_var("(AV|FF|SWS)_.*|LIB(AV|SW)[A-Z]+_VERSION_(MAJOR|MINOR|MICRO)")
-        // the flags sws_getContext takes as an int, which no function names
-        .allowlist_type("SwsFlags")
+        // types no function names: the flags sws_getContext takes as an int, and the device
+        // and frame pool a hardware frame's buffers lead to
+        .allowlist_type("SwsFlags|AVHWFramesContext|AVHWDeviceContext")
         // va_list is spelled differently on every target, and FILE belongs to the C runtime
         .blocklist_function("av_vlog|av_log_set_callback|av_log_default_callback|av_log_format_line2?|av_vbprintf|avio_vprintf")
         .blocklist_function("av_hex_dump|av_pkt_dump2|avcodec_string")

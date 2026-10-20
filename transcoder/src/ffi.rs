@@ -1704,6 +1704,49 @@ pub const AV_HWDEVICE_TYPE_D3D12VA: AVHWDeviceType = 12;
 pub const AV_HWDEVICE_TYPE_AMF: AVHWDeviceType = 13;
 pub const AV_HWDEVICE_TYPE_OHCODEC: AVHWDeviceType = 14;
 pub type AVHWDeviceType = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AVHWDeviceContext {
+    pub av_class: *const AVClass,
+    pub type_: AVHWDeviceType,
+    pub hwctx: *mut ::std::os::raw::c_void,
+    pub free: ::std::option::Option<unsafe extern "C" fn(ctx: *mut AVHWDeviceContext)>,
+    pub user_opaque: *mut ::std::os::raw::c_void,
+}
+impl Default for AVHWDeviceContext {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AVHWFramesContext {
+    pub av_class: *const AVClass,
+    pub device_ref: *mut AVBufferRef,
+    pub device_ctx: *mut AVHWDeviceContext,
+    pub hwctx: *mut ::std::os::raw::c_void,
+    pub free: ::std::option::Option<unsafe extern "C" fn(ctx: *mut AVHWFramesContext)>,
+    pub user_opaque: *mut ::std::os::raw::c_void,
+    pub pool: *mut AVBufferPool,
+    pub initial_pool_size: ::std::os::raw::c_int,
+    pub format: AVPixelFormat,
+    pub sw_format: AVPixelFormat,
+    pub width: ::std::os::raw::c_int,
+    pub height: ::std::os::raw::c_int,
+}
+impl Default for AVHWFramesContext {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 pub const AV_HWFRAME_TRANSFER_DIRECTION_FROM: AVHWFrameTransferDirection = 0;
 pub const AV_HWFRAME_TRANSFER_DIRECTION_TO: AVHWFrameTransferDirection = 1;
 pub type AVHWFrameTransferDirection = ::std::os::raw::c_uint;
