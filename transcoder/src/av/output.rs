@@ -1,8 +1,48 @@
-use super::encoder::{self, Encoder};
+use super::encoder::{self, Encoder, ORDER};
 use super::filter::Filter;
 use super::hw::{self, Frames, Kind};
-use super::{Colors, Frame, Picture, PixelFormat, Scaler};
+use super::{Colors, Frame, Layout, Picture, PixelFormat, Pool, Scaler};
+use crate::annexb::{self, Profile};
 use crate::ffi;
+
+/// The encoders this build tries, best first.
+pub fn encoder_names() -> impl Iterator<Item = &'static str> {
+    ORDER.iter().map(|s| s.name)
+}
+
+/// One encoder of the list as this host has it.
+pub struct Survey {
+    pub name: &'static str,
+    /// How it takes a picture in system memory and the profile its stream states, None when
+    /// it does not open.
+    pub opened: Option<(String, Option<Profile>)>,
+    /// The device whose pictures it takes in place.
+    pub in_place: Option<&'static str>,
+}
+
+/// Every encoder of the list, opened here for a 1280x720 picture.
+pub fn survey() -> Vec<Survey> {
+    let (w, h) = (1280, 720);
+    let pixels = vec![128u8; (w * h * 3 / 2) as usize];
+    let mut raw = Frame::new();
+    let picture = raw.wrap(&pixels, Layout { width: w, height: h, stride: 0, format: PixelFormat::NV12 }).and_then(|p| Pool::default().own(&p)).map(Picture::new);
+    ORDER
+        .iter()
+        .map(|spec| {
+            let opened = picture.as_ref().and_then(|p| Output::open(p, w, h, 30.0, Some(spec.name), &[])).map(|mut o| {
+                let mut profile = None;
+                // some encoders hold the first picture back
+                for i in 0..5 {
+                    if profile.is_none() && let Some(p) = &picture {
+                        o.encode(p, i * 33_333, i == 0, |data, _| profile = profile.or(annexb::profile(data)));
+                    }
+                }
+                (o.describe(), profile)
+            });
+            Survey { name: spec.name, opened, in_place: spec.device.map(|(kind, _)| hw::name(kind.kind)) }
+        })
+        .collect()
+}
 
 /// The device whose pictures the encoder takes in place, None when it takes none.
 pub(super) fn device_for(encoder: &str) -> Option<Kind> {
@@ -120,8 +160,19 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av::{CodecId, Decoder, Layout, Pool};
+    use crate::av::{CodecId, Decoder};
     use crate::rules::video_size;
+
+    #[test]
+    fn every_encoder_makes_constrained_baseline() {
+        let found = survey();
+        assert!(found.iter().any(|s| s.opened.is_some()), "no encoder opens");
+        for s in found {
+            let Some((how, profile)) = s.opened else { continue };
+            eprintln!("{how}: {profile:?}");
+            assert!(profile.is_some_and(Profile::constrained_baseline), "{how} makes {profile:?}");
+        }
+    }
 
     #[test]
     fn every_video_size_encodes() {

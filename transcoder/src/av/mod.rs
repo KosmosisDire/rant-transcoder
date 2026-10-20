@@ -16,7 +16,7 @@ use scaler::Scaler;
 pub use decoder::Decoder;
 pub use frame::{Frame, Layout, Picture, Pool, Wrapped};
 pub use input::{Input, InputPacket};
-pub use output::Output;
+pub use output::{Output, Survey, encoder_names, survey};
 
 use std::ffi::{CStr, CString};
 use std::fmt;

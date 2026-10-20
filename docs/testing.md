@@ -11,6 +11,8 @@ cargo test
   decoder and encoder this machine has, on the GPU where an encoder takes pictures in place,
   and checks the H264 holds 16 and 235. `cargo test every_path -- --nocapture` lists the
   paths it took.
+- `every_encoder_makes_constrained_baseline` in `src/av/output.rs` checks the profile each
+  encoder's stream states. `rant-transcoder --list-encoders` shows the same on any host.
 - `transcoder/tests/transcode.rs` runs a camera, the transcoder and a viewer in one process
   and checks which children exist, at what size and rate. It takes about 20 s.
 - The camera and the viewer live in `transcoder/tests/common`, shared with the bench. The
@@ -20,8 +22,10 @@ cargo test
 ## Linux
 
 Run the tests in `quay.io/pypa/manylinux_2_28_x86_64`, the image the Linux package builds in,
-with rustup's minimal profile and `CARGO_TARGET_DIR` inside the container. There every
-encoder and decoder is software.
+with rustup's minimal profile and `CARGO_TARGET_DIR` inside the container. Every encoder and
+decoder is software there, unless `--gpus all` and `NVIDIA_DRIVER_CAPABILITIES=all` give the
+container an NVIDIA GPU, which NVENC and CUDA then use. VAAPI cannot be reached from a
+container on Windows.
 
 ## Costs
 

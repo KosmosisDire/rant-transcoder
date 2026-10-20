@@ -2,6 +2,7 @@
 //! whether one is a keyframe, and the parameter sets a viewer joining on a keyframe needs.
 
 use std::borrow::Cow;
+use std::fmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Codec {
@@ -13,6 +14,14 @@ pub enum Codec {
 pub struct Nal<'a> {
     pub kind: u8,
     pub bytes: &'a [u8],
+}
+
+impl<'a> Nal<'a> {
+    /// The unit without its start code.
+    pub fn body(&self) -> &'a [u8] {
+        let bytes = self.bytes;
+        if bytes.starts_with(&[0, 0, 0, 1]) { &bytes[4..] } else { &bytes[3..] }
+    }
 }
 
 /// The NAL units of an Annex B buffer. A start code with nothing after it yields nothing.
@@ -67,6 +76,43 @@ pub fn has_idr(codec: Codec, data: &[u8]) -> bool {
 const H264_SPS: u8 = 7;
 const H264_PPS: u8 = 8;
 
+/// What an H264 stream says it is in its SPS: its profile, the constraints it keeps and its level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Profile {
+    pub idc: u8,
+    pub constraints: u8,
+    pub level: u8,
+}
+
+impl Profile {
+    /// Baseline that keeps to its constrained subset, which every WebRTC browser decodes.
+    pub fn constrained_baseline(self) -> bool {
+        self.idc == 66 && self.constraints & 0x40 != 0
+    }
+}
+
+impl fmt::Display for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.idc {
+            66 if self.constrained_baseline() => f.write_str("constrained baseline")?,
+            66 => f.write_str("baseline")?,
+            77 => f.write_str("main")?,
+            100 => f.write_str("high")?,
+            idc => write!(f, "profile {idc}")?,
+        }
+        write!(f, " level {}.{}", self.level / 10, self.level % 10)
+    }
+}
+
+/// The profile the access unit's SPS states, None when it holds none.
+pub fn profile(data: &[u8]) -> Option<Profile> {
+    let sps = units(Codec::H264, data).find(|n| n.kind == H264_SPS)?;
+    match sps.body() {
+        [_, idc, constraints, level, ..] => Some(Profile { idc: *idc, constraints: *constraints, level: *level }),
+        _ => None,
+    }
+}
+
 /// The latest SPS and PPS out of an H264 encoder, put in front of a keyframe that lacks them,
 /// since some encoders send them only once.
 #[derive(Default)]
@@ -113,6 +159,17 @@ mod tests {
         // an H265 IDR_W_RADL (19) and a TRAIL_R (1)
         assert!(has_idr(Codec::H265, &[0, 0, 1, 19 << 1, 1, 7]));
         assert!(!has_idr(Codec::H265, &[0, 0, 1, 1 << 1, 1, 7]));
+    }
+
+    #[test]
+    fn reads_the_profile() {
+        let p = profile(&[0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0xda, 0, 0, 1, 0x68, 3]).unwrap();
+        assert!(p.constrained_baseline());
+        assert_eq!(p.to_string(), "constrained baseline level 3.1");
+        assert_eq!(profile(&[0, 0, 1, 0x67, 0x42, 0x00, 0x28]).unwrap().to_string(), "baseline level 4.0");
+        assert_eq!(profile(&[0, 0, 1, 0x67, 0x64, 0x08, 0x33]).unwrap().to_string(), "high level 5.1");
+        assert_eq!(profile(INTER), None);
+        assert_eq!(profile(&[0, 0, 1, 0x67, 0x42]), None);
     }
 
     #[test]
