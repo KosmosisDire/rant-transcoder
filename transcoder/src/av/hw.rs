@@ -29,6 +29,7 @@ pub(super) struct Kind {
 }
 
 impl Kind {
+    #[cfg(not(target_os = "macos"))]
     pub(super) const CUDA: Kind = Kind { kind: ffi::AV_HWDEVICE_TYPE_CUDA, vendor: 0 };
     /// Intel's, whose pictures Quick Sync encodes in place.
     #[cfg(windows)]
