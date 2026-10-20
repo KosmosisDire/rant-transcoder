@@ -19,6 +19,9 @@ namespace {
 /* Rant's topic name limit, which a child's name must also fit. */
 constexpr size_t kNameMax = 64;
 
+/* A name read from the mesh, as given to a create. The '/' skips the RANT_PREFIX a launcher set. */
+std::string absolute(const std::string& name) { return "/" + name; }
+
 /* One child's encoding state inside the worker. */
 struct Tier {
     Encoder encoder;
@@ -51,14 +54,14 @@ Stream::Stream(rant::Node& node, Parent parent, std::string encoder)
     }
     try {
         /* pictures and URLs always change on the way to Video, a VideoFrame topic waits for its codec */
-        if (parent_.origin != Origin::VideoFrame) video_ = node_.publisher<VideoFrame>(parent_.name + "/Video");
+        if (parent_.origin != Origin::VideoFrame) video_ = node_.publisher<VideoFrame>(absolute(parent_.name + "/Video"));
         if (parent_.origin == Origin::StreamVariable) {
-            descriptor_var_ = node_.remote_variable<ExternalVideoStream>(parent_.name);
+            descriptor_var_ = node_.remote_variable<ExternalVideoStream>(absolute(parent_.name));
             descriptor_var_.on_change([this](const ExternalVideoStream& d) { set_descriptor(d); });
         } else if (parent_.origin == Origin::StreamTopic) {
             rant::Qos q;
             q.catch_up = 1;
-            descriptor_topic_ = node_.subscriber<ExternalVideoStream>(parent_.name, q);
+            descriptor_topic_ = node_.subscriber<ExternalVideoStream>(absolute(parent_.name), q);
         }
     } catch (const rant::Error& e) {
         say("%s: %s", parent_.name.c_str(), e.what());
@@ -143,7 +146,7 @@ void Stream::child(rant::Publisher<VideoFrame>& pub, bool need, const char* suff
         return;
     }
     try {
-        pub = node_.publisher<VideoFrame>(parent_.name + suffix);
+        pub = node_.publisher<VideoFrame>(absolute(parent_.name + suffix));
     } catch (const rant::Error& e) {
         say("%s%s: %s", parent_.name.c_str(), suffix, e.what());
     }
@@ -222,7 +225,7 @@ void Stream::run() {
                 if (!url.empty()) src = open_url(url, kind, stop_, error);
                 else error = "no URL yet";
             } else {
-                src = open_topic(node_, parent_.name, parent_.origin == Origin::Image, parent_.peer);
+                src = open_topic(node_, absolute(parent_.name), parent_.origin == Origin::Image, parent_.peer);
                 if (!src) error = "the subscription failed";
             }
             if (!src) {

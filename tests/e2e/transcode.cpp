@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -176,6 +177,16 @@ static VideoFrame frame_of(const Clip& clip, int i, rant::types::VideoCodec code
     return vf;
 }
 
+/* Sets a variable of this process, or clears it when value is empty. */
+static void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    if (*value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
 /* One child the viewer watches. width 0 = the transcoder must not publish it. */
 struct Expect {
     const char* name;
@@ -193,14 +204,14 @@ int main() {
 
     std::atomic<bool> done{ false };
 
-    /* the transcoder */
+    /* the transcoder, launched under a prefix of its own, which the names it reads from the mesh skip */
     Options o;
     o.domain = kDomain;
     o.interface = kLoopback;
-    std::thread transcoder([&] {
-        Transcoder t(o);
-        t.run([&] { return done.load(); });
-    });
+    set_env("RANT_PREFIX", "Elsewhere");
+    Transcoder t(o);
+    set_env("RANT_PREFIX", "");
+    std::thread transcoder([&] { t.run([&] { return done.load(); }); });
 
     /* the camera */
     rant::NodeOptions no;
