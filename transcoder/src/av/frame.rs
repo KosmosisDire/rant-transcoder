@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::raw::c_int;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 use super::PixelFormat;
 use crate::ffi;
@@ -47,6 +48,21 @@ impl Frame {
 
     pub(super) fn as_mut_ptr(&mut self) -> *mut ffi::AVFrame {
         self.ptr.as_ptr()
+    }
+
+    /// The picture is in a device's memory, not the system's.
+    pub(super) fn on_device(&self) -> bool {
+        !self.raw().hw_frames_ctx.is_null()
+    }
+
+    /// A device picture copied to system memory, with its range and matrix, which the
+    /// transfer itself leaves behind.
+    fn download(&self) -> Option<Frame> {
+        let mut f = Frame::new();
+        // SAFETY: both frames are valid and the new one is empty
+        unsafe {
+            (ffi::av_hwframe_transfer_data(f.as_mut_ptr(), self.as_ptr(), 0) >= 0 && ffi::av_frame_copy_props(f.as_mut_ptr(), self.as_ptr()) >= 0).then_some(f)
+        }
     }
 
     /// Drops the buffers the frame holds and resets its fields.
@@ -113,6 +129,32 @@ impl Drop for Frame {
         let mut p = self.ptr.as_ptr();
         // SAFETY: the frame is ours alone
         unsafe { ffi::av_frame_free(&mut p) };
+    }
+}
+
+/// A picture the children share, in system memory or on a device. A device picture comes down
+/// once, for the first child that needs it there.
+pub struct Picture {
+    frame: Frame,
+    system: OnceLock<Option<Frame>>,
+}
+
+impl Picture {
+    pub fn new(frame: Frame) -> Picture {
+        Picture { frame, system: OnceLock::new() }
+    }
+
+    /// The picture where it is.
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    /// The picture in system memory, None when it does not come down.
+    pub fn system(&self) -> Option<&Frame> {
+        if !self.frame.on_device() {
+            return Some(&self.frame);
+        }
+        self.system.get_or_init(|| self.frame.download()).as_ref()
     }
 }
 

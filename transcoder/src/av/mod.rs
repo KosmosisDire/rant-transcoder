@@ -3,17 +3,20 @@
 mod color;
 mod decoder;
 mod encoder;
+mod filter;
 mod frame;
 mod hw;
 mod input;
+mod output;
 mod scaler;
 
-pub use color::Colors;
+use color::Colors;
+use scaler::Scaler;
+
 pub use decoder::Decoder;
-pub use encoder::Encoder;
-pub use frame::{Frame, Layout, Pool, Wrapped};
+pub use frame::{Frame, Layout, Picture, Pool, Wrapped};
 pub use input::{Input, InputPacket};
-pub use scaler::Scaler;
+pub use output::Output;
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -62,9 +65,11 @@ pub fn set_log_level(verbose: bool) {
 pub struct Error(c_int);
 
 impl Error {
-    // AVERROR(EAGAIN) and AVERROR_EOF are macros bindgen cannot read
+    // AVERROR codes are macros bindgen cannot read, and only EAGAIN differs between systems
     const AGAIN: Error = Error(-if cfg!(target_os = "macos") { 35 } else { 11 });
     const EOF: Error = Error(-tag(b"EOF "));
+    const INVALID: Error = Error(-22);
+    const NO_MEMORY: Error = Error(-12);
 }
 
 /// AV_NOPTS_VALUE, a cast bindgen cannot read either.

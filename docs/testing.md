@@ -7,6 +7,10 @@ cargo test
 ```
 
 - Unit tests sit beside the code they test.
+- `every_path_keeps_black_and_white` in `src/av/color.rs` sends black and white through every
+  decoder and encoder this machine has, on the GPU where an encoder takes pictures in place,
+  and checks the H264 holds 16 and 235. `cargo test every_path -- --nocapture` lists the
+  paths it took.
 - `transcoder/tests/transcode.rs` runs a camera, the transcoder and a viewer in one process
   and checks which children exist, at what size and rate. It takes about 20 s.
 - The camera and the viewer live in `transcoder/tests/common`, shared with the bench. The

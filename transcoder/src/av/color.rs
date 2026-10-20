@@ -47,7 +47,7 @@ fn is_yuv(format: ffi::AVPixelFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::av::{CodecId, Decoder, Encoder, Layout, PixelFormat, Scaler};
+    use crate::av::{CodecId, Decoder, Layout, Output, Picture, PixelFormat, Pool, Scaler};
 
     const W: usize = 320;
     const H: usize = 240;
@@ -84,6 +84,11 @@ mod tests {
         }
     }
 
+    /// The same as raw gray pixels.
+    fn gray() -> Vec<u8> {
+        (0..H).flat_map(|_| (0..W).map(|x| if x < W / 2 { 0 } else { 255 })).collect()
+    }
+
     /// Luma at the middle of each half.
     fn levels(f: &Frame) -> (u8, u8) {
         let r = f.raw();
@@ -96,42 +101,64 @@ mod tests {
         got.0.abs_diff(want.0) <= 2 && got.1.abs_diff(want.1) <= 2
     }
 
-    #[test]
-    fn black_and_white_keep_their_levels() {
-        let jpeg = black_and_white();
-        let decoders = [Decoder::software(CodecId::MJPEG, None), Decoder::open(CodecId::MJPEG, None)];
-        for mut d in decoders.into_iter().flatten() {
-            let name = d.describe();
-            let mut units: Vec<Vec<u8>> = Vec::new();
-            let mut scaled = None;
-            assert!(d.decode(&jpeg, |picture| {
-                let colors = Colors::for_child(picture);
-                let mut enc = Encoder::open(W as u32, H as u32, 25.0, colors, None).expect("an H264 encoder opens");
-                let mut s = Scaler::default();
-                // a few frames, in case the encoder holds the first back
-                for i in 0..5 {
-                    let out = s.convert(picture, W as u32, H as u32, enc.format(), colors).unwrap();
-                    scaled = Some(levels(out));
-                    enc.encode(out, i * 40_000, i == 0, |data, _| units.push(data.to_vec()));
-                }
-            }), "{name} decodes");
-            assert!(scaled.is_some_and(|l| near(l, (16, 235))), "{name} scales to {scaled:?}");
+    /// Five frames of a picture through an output, as H264 access units.
+    fn encode(o: &mut Output, p: &Picture) -> Vec<Vec<u8>> {
+        let mut units = Vec::new();
+        for i in 0..5 {
+            o.encode(p, i * 40_000, i == 0, |data, _| units.push(data.to_vec()));
+        }
+        units
+    }
 
-            let mut h264 = Decoder::software(CodecId::H264, None).unwrap();
-            let mut seen = None;
-            for unit in &units {
-                h264.decode(unit, |f| seen = Some((f.raw().color_range, levels(f))));
+    /// The first picture a decoder makes of a stream.
+    fn first(d: &mut Decoder, units: &[Vec<u8>]) -> Option<Picture> {
+        let (mut pool, mut got) = (Pool::default(), None);
+        for u in units {
+            d.decode(u, |f| got = got.take().or_else(|| pool.own(f)));
+        }
+        got.map(Picture::new)
+    }
+
+    /// What a viewer sees of H264: the range the stream says, and the levels.
+    fn seen(units: &[Vec<u8>]) -> Option<(ffi::AVColorRange, (u8, u8))> {
+        let p = first(&mut Decoder::software(CodecId::H264, None)?, units)?;
+        Some((p.frame().raw().color_range, levels(p.system()?)))
+    }
+
+    #[test]
+    fn every_path_keeps_black_and_white() {
+        // a limited range H264 source, made from raw gray in system memory
+        let pixels = gray();
+        let mut raw = Frame::new();
+        let wrapped = raw.wrap(&pixels, Layout { width: W as u32, height: H as u32, stride: 0, format: PixelFormat::GRAY8 }).unwrap();
+        let picture = Picture::new(Pool::default().own(&wrapped).unwrap());
+        let h264 = encode(&mut Output::open(&picture, W as u32, H as u32, 25.0, None).unwrap(), &picture);
+
+        for (source, codec, units) in [("jpeg", CodecId::MJPEG, vec![black_and_white()]), ("h264", CodecId::H264, h264)] {
+            let decoders = [Decoder::software(codec, None), Decoder::open(codec, None, None), Decoder::open(codec, None, Some("h264_qsv"))];
+            let mut tried = Vec::new();
+            for mut d in decoders.into_iter().flatten() {
+                if tried.contains(&d.describe()) {
+                    continue;
+                }
+                tried.push(d.describe());
+                let picture = first(&mut d, &units).unwrap_or_else(|| panic!("{} decodes {source}", d.describe()));
+                for only in [None, Some("h264_qsv"), Some("libopenh264")] {
+                    let Some(mut o) = Output::open(&picture, W as u32, H as u32, 25.0, only) else { continue };
+                    let path = format!("{source} through {} into {}", d.describe(), o.describe());
+                    eprintln!("{path}");
+                    let (range, got) = seen(&encode(&mut o, &picture)).unwrap_or_else(|| panic!("{path}: the H264 decodes"));
+                    assert_eq!(range, ffi::AVCOL_RANGE_MPEG, "{path}: the stream says limited range");
+                    assert!(near(got, (16, 235)), "{path}: H264 carries {got:?}");
+                }
             }
-            let (range, got) = seen.unwrap_or_else(|| panic!("{name}: the H264 decodes"));
-            assert_eq!(range, ffi::AVCOL_RANGE_MPEG, "{name}: the stream says limited range");
-            assert!(near(got, (16, 235)), "{name}: H264 carries {got:?}");
         }
     }
 
     #[test]
     fn raw_gray_and_rgb_keep_their_levels() {
         for (format, size) in [(PixelFormat::GRAY8, 1), (PixelFormat::BGR24, 3)] {
-            let pixels: Vec<u8> = (0..H).flat_map(|_| (0..W).flat_map(move |x| [if x < W / 2 { 0 } else { 255 }; 3].into_iter().take(size))).collect();
+            let pixels: Vec<u8> = gray().into_iter().flat_map(|v| [v; 3].into_iter().take(size)).collect();
             let mut f = Frame::new();
             let picture = f.wrap(&pixels, Layout { width: W as u32, height: H as u32, stride: 0, format }).unwrap();
             let mut s = Scaler::default();

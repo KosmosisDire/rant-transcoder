@@ -7,13 +7,13 @@ use std::thread::JoinHandle;
 use rant::types::{VideoCodec, VideoFrame};
 use tracing::{info, warn};
 
-use crate::av::{Colors, Encoder, Frame, Scaler};
+use crate::av::{Output, Picture};
 use crate::rules::{PREVIEW_FPS, RateGate, preview_size};
 use crate::stream::{Flags, Shared, publish};
 
 /// A picture for a child, with the source's rate when it came.
 pub struct Job {
-    pub picture: Arc<Frame>,
+    pub picture: Arc<Picture>,
     pub time_us: u64,
     pub fps: f64,
 }
@@ -45,8 +45,7 @@ impl Child {
             only,
             shared,
             flags,
-            encoder: None,
-            scaler: Scaler::default(),
+            output: None,
             failed: None,
             gate: preview.then(|| RateGate::new(PREVIEW_FPS)),
             out: VideoFrame { codec: VideoCodec::H264, ..VideoFrame::default() },
@@ -80,8 +79,7 @@ struct Encoding {
     only: Option<String>,
     shared: Arc<Mutex<Shared>>,
     flags: Arc<Flags>,
-    encoder: Option<Encoder>,
-    scaler: Scaler,
+    output: Option<Output>,
     /// The size no encoder opened at, not retried.
     failed: Option<(u32, u32)>,
     gate: Option<RateGate>,
@@ -111,39 +109,38 @@ impl Encoding {
             return;
         }
         let p = &*job.picture;
+        let (width, height) = (p.frame().width(), p.frame().height());
         let (w, h, fps) = if self.preview {
-            let (w, h) = preview_size(p.width(), p.height());
+            let (w, h) = preview_size(width, height);
             (w, h, job.fps.min(PREVIEW_FPS))
         } else {
-            (p.width(), p.height(), job.fps)
+            (width, height, job.fps)
         };
-        if !self.ready(w, h, fps, Colors::for_child(p)) {
+        if !self.ready(p, w, h, fps) {
             return;
         }
-        let Some(e) = &mut self.encoder else { return };
-        if let Some(f) = self.scaler.convert(p, w, h, e.format(), e.colors()) {
-            let (shared, out, preview, t) = (&self.shared, &mut self.out, self.preview, job.time_us);
-            e.encode(f, t, self.flags.take_key(preview), |data, key| publish(shared, out, preview, data, key, w, h, t));
-        }
+        let Some(o) = &mut self.output else { return };
+        let (shared, out, preview, t) = (&self.shared, &mut self.out, self.preview, job.time_us);
+        o.encode(p, t, self.flags.take_key(preview), |data, key| publish(shared, out, preview, data, key, w, h, t));
     }
 
-    /// Opens the encoder for a size and colours when it is not open for them already.
-    fn ready(&mut self, width: u32, height: u32, fps: f64, colors: Colors) -> bool {
-        if self.encoder.as_ref().is_some_and(|e| e.width() == width && e.height() == height && e.colors() == colors) {
+    /// Opens the output for pictures like this one at a size when it is not open for them already.
+    fn ready(&mut self, picture: &Picture, width: u32, height: u32, fps: f64) -> bool {
+        if self.output.as_ref().is_some_and(|o| o.fits(picture, width, height)) {
             return true;
         }
         if self.failed == Some((width, height)) {
             return false;
         }
-        self.encoder = None; // a GeForce counts the open sessions
-        self.encoder = Encoder::open(width, height, fps, colors, self.only.as_deref());
-        match &self.encoder {
-            Some(e) => info!("{}: {width}x{height} at {fps:.1} fps with {}", self.name, e.name()),
+        self.output = None; // a GeForce counts the open sessions
+        self.output = Output::open(picture, width, height, fps, self.only.as_deref());
+        match &self.output {
+            Some(o) => info!("{}: {width}x{height} at {fps:.1} fps with {}", self.name, o.describe()),
             None => {
                 self.failed = Some((width, height));
                 warn!("{}: no H264 encoder opens at {width}x{height}", self.name);
             }
         }
-        self.encoder.is_some()
+        self.output.is_some()
     }
 }

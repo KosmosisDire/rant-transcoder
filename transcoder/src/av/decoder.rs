@@ -5,15 +5,13 @@ use super::hw::{self, Device};
 use super::{CodecId, CodecParameters, Error, Frame, Packet, Dict, static_text};
 use crate::ffi;
 
-/// Decodes one codec, on a hardware device when one takes it. Pictures come out in system
-/// memory.
+/// Decodes one codec, on a hardware device when one takes it, whose pictures stay there.
 pub struct Decoder {
     ctx: *mut ffi::AVCodecContext,
     codec: CodecId,
     params: Option<CodecParameters>,
     packet: Packet,
     frame: Frame,
-    download: Frame,
     /// The device's picture format, NONE in software.
     hw: ffi::AVPixelFormat,
     errors: u32,
@@ -23,15 +21,16 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 
 impl Decoder {
-    /// `params` carries a demuxed stream's extradata, None for a Rant topic. None when no
-    /// decoder opens.
-    pub fn open(codec: CodecId, params: Option<&CodecParameters>) -> Option<Decoder> {
+    /// `params` carries a demuxed stream's extradata, None for a Rant topic. The device the
+    /// `encoder` takes pictures from in place comes first. None when no decoder opens.
+    pub fn open(codec: CodecId, params: Option<&CodecParameters>, encoder: Option<&str>) -> Option<Decoder> {
         let mut d = Decoder::closed(codec, params);
         // SAFETY: a lookup in FFmpeg's static tables
         let native = unsafe { ffi::avcodec_find_decoder(codec.0) };
+        let first = encoder.and_then(super::output::device_for);
         if !native.is_null() {
-            for kind in hw::DECODE {
-                let format = device_format(native, kind);
+            for kind in first.into_iter().chain(hw::DECODE.iter().copied().filter(|&k| Some(k) != first)) {
+                let format = device_format(native, kind.kind);
                 if format == ffi::AV_PIX_FMT_NONE {
                     continue;
                 }
@@ -58,7 +57,6 @@ impl Decoder {
             params: params.cloned(),
             packet: Packet::new(),
             frame: Frame::new(),
-            download: Frame::new(),
             hw: ffi::AV_PIX_FMT_NONE,
             errors: 0,
         }
@@ -91,6 +89,8 @@ impl Decoder {
                 // the format itself rides in opaque, so the callback needs no pointer back to us
                 c.opaque = format as isize as *mut c_void;
                 c.get_format = Some(pick_format);
+                // a device pool can be fixed, and each child holds a picture or two from it
+                c.extra_hw_frames = 8;
                 self.hw = format;
             }
             // dav1d's own low latency switch
@@ -110,8 +110,8 @@ impl Decoder {
         !self.ctx.is_null()
     }
 
-    /// Feeds one access unit. `out` runs for each picture it completes. False on a decode
-    /// error, so the caller waits for the next keyframe.
+    /// Feeds one access unit. `out` runs for each picture it completes, which may be on a
+    /// device. False on a decode error, so the caller waits for the next keyframe.
     pub fn decode(&mut self, data: &[u8], mut out: impl FnMut(&Frame)) -> bool {
         if self.ctx.is_null() || data.is_empty() {
             return false;
@@ -136,19 +136,8 @@ impl Decoder {
                 if r < 0 {
                     return self.fail();
                 }
-                let downloaded = self.hw != ffi::AV_PIX_FMT_NONE && (*self.frame.as_ptr()).format == self.hw;
-                if downloaded {
-                    self.download.unref();
-                    // the transfer moves pixels only, and the range and matrix must come along
-                    if ffi::av_hwframe_transfer_data(self.download.as_mut_ptr(), self.frame.as_ptr(), 0) < 0
-                        || ffi::av_frame_copy_props(self.download.as_mut_ptr(), self.frame.as_ptr()) < 0
-                    {
-                        self.frame.unref();
-                        return self.fail();
-                    }
-                }
                 self.errors = 0;
-                out(if downloaded { &self.download } else { &self.frame });
+                out(&self.frame);
                 self.frame.unref();
             }
         }
@@ -170,14 +159,18 @@ impl Decoder {
         false
     }
 
-    /// The decoder's name, and the device's picture format when in hardware.
+    /// The decoder's name, and the device when in hardware.
     pub fn describe(&self) -> String {
         if self.ctx.is_null() {
             return "closed".into();
         }
         // SAFETY: an open context names its codec
         let name = static_text(unsafe { (*(*self.ctx).codec).name });
-        if self.hw == ffi::AV_PIX_FMT_NONE { name.into() } else { format!("{name} on {:?}", super::PixelFormat(self.hw)) }
+        // SAFETY: an open context's device reference is null or valid
+        match hw::type_of(unsafe { (*self.ctx).hw_device_ctx }) {
+            Some(device) if self.hw != ffi::AV_PIX_FMT_NONE => format!("{name} on {}", hw::name(device)),
+            _ => name.into(),
+        }
     }
 }
 

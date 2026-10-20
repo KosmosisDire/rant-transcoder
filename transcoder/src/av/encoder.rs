@@ -14,6 +14,11 @@ const ORDER: &[&str] = &["h264_videotoolbox", "libopenh264"];
 #[cfg(not(any(windows, target_os = "macos")))]
 const ORDER: &[&str] = &["h264_nvenc", "h264_qsv", "libopenh264"];
 
+/// The encoders to try, or only the one named.
+pub(super) fn names(only: Option<&str>) -> Vec<&str> {
+    only.map_or(ORDER.to_vec(), |n| vec![n])
+}
+
 /// An H264 encoder set for low latency: no B frames, no lookahead, constrained baseline,
 /// parameter sets in front of every keyframe.
 pub struct Encoder {
@@ -28,39 +33,52 @@ pub struct Encoder {
 unsafe impl Send for Encoder {}
 
 impl Encoder {
-    /// The first encoder that opens at this size, or only the one named. None when none does.
-    pub fn open(width: u32, height: u32, fps: f64, colors: Colors, only: Option<&str>) -> Option<Encoder> {
+    /// The first encoder that opens at this size for pictures in system memory, or only the
+    /// one named. None when none does.
+    pub(super) fn open(width: u32, height: u32, fps: f64, colors: Colors, only: Option<&str>) -> Option<Encoder> {
+        names(only).into_iter().find_map(|name| Encoder::open_named(name, width, height, fps, colors, std::ptr::null_mut()))
+    }
+
+    /// The encoder named, taking pictures from a device's pool in place.
+    pub(super) fn open_on(name: &str, frames: *mut ffi::AVBufferRef, width: u32, height: u32, fps: f64, colors: Colors) -> Option<Encoder> {
+        if frames.is_null() { None } else { Encoder::open_named(name, width, height, fps, colors, frames) }
+    }
+
+    fn open_named(name: &str, width: u32, height: u32, fps: f64, colors: Colors, frames: *mut ffi::AVBufferRef) -> Option<Encoder> {
         let fps = if fps > 0.0 { fps } else { 30.0 };
-        let names: Vec<&str> = only.map_or(ORDER.to_vec(), |n| vec![n]);
-        for name in names {
-            if name == "h264_qsv" && cfg!(target_os = "linux") && !hw::have_vaapi() {
-                continue;
+        if name == "h264_qsv" && cfg!(target_os = "linux") && !hw::have_vaapi() {
+            return None;
+        }
+        let cname = CString::new(name).ok()?;
+        // SAFETY: a lookup in FFmpeg's static tables, then a fresh context set up before its
+        // open and freed when the open fails. A pool reference is a hardware frames context
+        unsafe {
+            let codec = ffi::avcodec_find_encoder_by_name(cname.as_ptr());
+            if codec.is_null() {
+                return None;
             }
-            let Ok(cname) = CString::new(name) else { continue };
-            // SAFETY: a lookup in FFmpeg's static tables, then a fresh context set up before
-            // its open and freed when the open fails
-            unsafe {
-                let codec = ffi::avcodec_find_encoder_by_name(cname.as_ptr());
-                if codec.is_null() {
-                    continue;
-                }
-                let mut ctx = ffi::avcodec_alloc_context3(codec);
-                let c = &mut *ctx;
-                c.width = width as c_int;
-                c.height = height as c_int;
-                c.time_base = ffi::AVRational { num: 1, den: 1_000_000 };
-                c.framerate = ffi::av_d2q(fps, 1000);
+            let mut ctx = ffi::avcodec_alloc_context3(codec);
+            let c = &mut *ctx;
+            c.width = width as c_int;
+            c.height = height as c_int;
+            c.time_base = ffi::AVRational { num: 1, den: 1_000_000 };
+            c.framerate = ffi::av_d2q(fps, 1000);
+            if let Some(pool) = frames.as_ref() {
+                let pool_ctx = &*(pool.data as *const ffi::AVHWFramesContext);
+                (c.pix_fmt, c.sw_pix_fmt) = (pool_ctx.format, pool_ctx.sw_format);
+                c.hw_frames_ctx = ffi::av_buffer_ref(frames);
+            } else {
                 c.pix_fmt = input_format(ctx, codec);
-                c.bit_rate = bitrate_for(width, height, fps);
-                c.gop_size = ((fps * 2.0).round() as c_int).max(1);
-                c.max_b_frames = 0;
-                colors.stamp_encoder(c);
-                let mut options = Dict::of(tune(name));
-                if ffi::avcodec_open2(ctx, codec, &mut options.0) == 0 {
-                    return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, params: ParameterSets::default() });
-                }
-                ffi::avcodec_free_context(&mut ctx);
             }
+            c.bit_rate = bitrate_for(width, height, fps);
+            c.gop_size = ((fps * 2.0).round() as c_int).max(1);
+            c.max_b_frames = 0;
+            colors.stamp_encoder(c);
+            let mut options = Dict::of(tune(name));
+            if ffi::avcodec_open2(ctx, codec, &mut options.0) == 0 {
+                return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, params: ParameterSets::default() });
+            }
+            ffi::avcodec_free_context(&mut ctx);
         }
         None
     }
@@ -70,32 +88,32 @@ impl Encoder {
         unsafe { &*self.ctx }
     }
 
-    pub fn width(&self) -> u32 {
+    pub(super) fn width(&self) -> u32 {
         self.raw().width as u32
     }
 
-    pub fn height(&self) -> u32 {
+    pub(super) fn height(&self) -> u32 {
         self.raw().height as u32
     }
 
     /// The colours its stream signals.
-    pub fn colors(&self) -> Colors {
+    pub(super) fn colors(&self) -> Colors {
         self.colors
     }
 
     /// The picture format it takes.
-    pub fn format(&self) -> PixelFormat {
+    pub(super) fn format(&self) -> PixelFormat {
         PixelFormat(self.raw().pix_fmt)
     }
 
-    pub fn name(&self) -> &'static str {
+    pub(super) fn name(&self) -> &'static str {
         // SAFETY: an open context names its codec
         static_text(unsafe { (*self.raw().codec).name })
     }
 
     /// Encodes a picture at the encoder's size and format. `keyframe` forces an IDR. `out`
     /// gets each access unit in Annex B and whether it is a keyframe.
-    pub fn encode(&mut self, picture: &mut Frame, time_us: u64, keyframe: bool, mut out: impl FnMut(&[u8], bool)) {
+    pub(super) fn encode(&mut self, picture: &mut Frame, time_us: u64, keyframe: bool, mut out: impl FnMut(&[u8], bool)) {
         let pts = (time_us as i64).max(self.last_pts.saturating_add(1));
         self.last_pts = pts;
         // SAFETY: the picture is ours to stamp, and each packet is ours between receive and unref

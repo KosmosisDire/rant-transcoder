@@ -12,7 +12,7 @@ use rant::types::{ExternalVideoStream, Timestamp, VideoCodec, VideoFrame, VideoS
 use rant::{Node, Publisher, Qos, RemoteVariable, Subscriber, VariableOptions};
 use tracing::{info, warn};
 
-use crate::av::{CodecId, CodecParameters, Decoder, Frame, Pool};
+use crate::av::{CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
 use crate::child::{Child, Job};
 use crate::rules::{RateMeter, needs_preview};
 use crate::source::{Payload, Source, TopicSource, UrlSource};
@@ -376,7 +376,7 @@ impl Worker {
                     }
                     if (video && !pass) || preview || width == 0 {
                         if !dec.as_ref().is_some_and(Decoder::is_open) {
-                            dec = Decoder::open(codec, params.as_ref());
+                            dec = Decoder::open(codec, params.as_ref(), self.encoder.as_deref());
                             match &dec {
                                 Some(d) => info!("{}: decoding with {}", self.parent.name, d.describe()),
                                 None => {
@@ -430,7 +430,7 @@ impl Worker {
     /// Hands one picture to the children that take it, each encoding it on its own thread.
     fn feed(&self, children: &mut Children, picture: &Frame, to_video: bool, preview: bool, fps: f64, time_us: u64) {
         // the children read it after the source has moved on, so it needs a frame of its own
-        let Some(picture) = children.pool.own(picture).map(Arc::new) else { return };
+        let Some(picture) = children.pool.own(picture).map(|f| Arc::new(Picture::new(f))) else { return };
         for (wanted, slot, is_preview) in [(to_video, &mut children.video, false), (preview, &mut children.preview, true)] {
             if wanted {
                 let c = slot.get_or_insert_with(|| Child::start(&self.parent.name, is_preview, self.encoder.clone(), self.shared.clone(), self.flags.clone()));

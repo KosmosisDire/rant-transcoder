@@ -209,7 +209,7 @@ impl Watch {
         if f.codec != VideoCodec::H264 || (!self.synced && !f.keyframe) {
             return;
         }
-        let d = self.decoder.get_or_insert_with(|| Decoder::open(CodecId::H264, None).expect("an H264 decoder"));
+        let d = self.decoder.get_or_insert_with(|| Decoder::open(CodecId::H264, None, None).expect("an H264 decoder"));
         let (size, decoded) = (&mut self.size, &mut self.decoded);
         self.synced = d.decode(&f.data, |p| {
             *size = (p.width(), p.height());
