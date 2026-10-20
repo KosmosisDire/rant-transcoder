@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::os::raw::c_int;
 
+use super::hw::Frames;
 use super::{Error, Frame};
 use crate::ffi;
 
@@ -89,10 +90,10 @@ impl Filter {
         Shape::of(picture) == self.takes
     }
 
-    /// The pool of the pictures it gives out, null in system memory.
-    pub(super) fn frames(&self) -> *mut ffi::AVBufferRef {
+    /// The pool of the pictures it gives out, None in system memory.
+    pub(super) fn frames(&self) -> Option<Frames> {
         // SAFETY: a configured sink
-        unsafe { ffi::av_buffersink_get_hw_frames_ctx(self.sink) }
+        Frames::of(unsafe { ffi::av_buffersink_get_hw_frames_ctx(self.sink) })
     }
 
     /// Runs one picture through, and `out` gets each that comes out. False when the chain

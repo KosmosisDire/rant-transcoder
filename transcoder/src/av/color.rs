@@ -47,6 +47,7 @@ fn is_yuv(format: ffi::AVPixelFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::av::encoder::ORDER;
     use crate::av::{CodecId, Decoder, Layout, Output, Picture, PixelFormat, Pool, Scaler};
 
     const W: usize = 320;
@@ -143,12 +144,13 @@ mod tests {
                 }
                 tried.push(d.describe());
                 let picture = first(&mut d, &units).unwrap_or_else(|| panic!("{} decodes {source}", d.describe()));
-                for only in [None, Some("h264_qsv"), Some("libopenh264")] {
+                for only in std::iter::once(None).chain(ORDER.iter().map(|s| Some(s.name))) {
                     let Some(mut o) = Output::open(&picture, W as u32, H as u32, 25.0, only) else { continue };
                     let path = format!("{source} through {} into {}", d.describe(), o.describe());
                     eprintln!("{path}");
                     let (range, got) = seen(&encode(&mut o, &picture)).unwrap_or_else(|| panic!("{path}: the H264 decodes"));
-                    assert_eq!(range, ffi::AVCOL_RANGE_MPEG, "{path}: the stream says limited range");
+                    // H264 without a stated range is limited, which Media Foundation leaves unsaid
+                    assert_ne!(range, ffi::AVCOL_RANGE_JPEG, "{path}: the stream says full range");
                     assert!(near(got, (16, 235)), "{path}: H264 carries {got:?}");
                 }
             }

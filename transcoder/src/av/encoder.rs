@@ -1,22 +1,83 @@
 use std::ffi::{CString, c_void};
 use std::os::raw::c_int;
 
-use super::{Colors, Dict, Frame, Packet, PixelFormat, hw, static_text};
+use super::hw::{self, Frames, Kind};
+use super::{Colors, Dict, Frame, Packet, PixelFormat, static_text};
 use crate::annexb::ParameterSets;
 use crate::ffi;
 
-/// The H264 encoders tried, best first: the hardware ones, then openh264. A full NVENC
-/// falls through to the next.
-#[cfg(windows)]
-const ORDER: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libopenh264"];
-#[cfg(target_os = "macos")]
-const ORDER: &[&str] = &["h264_videotoolbox", "libopenh264"];
-#[cfg(not(any(windows, target_os = "macos")))]
-const ORDER: &[&str] = &["h264_nvenc", "h264_qsv", "libopenh264"];
+/// FFmpeg filters that bring a device's pictures to a width and height, NV12 and limited
+/// range, told whether they are full range now.
+pub(super) type Chain = fn(u32, u32, bool) -> String;
 
-/// The encoders to try, or only the one named.
-pub(super) fn names(only: Option<&str>) -> Vec<&str> {
-    only.map_or(ORDER.to_vec(), |n| vec![n])
+/// What the transcoder knows of one H264 encoder.
+pub(super) struct Spec {
+    pub(super) name: &'static str,
+    /// Its low latency settings, constrained baseline among them, which every browser decodes.
+    tune: &'static [(&'static str, &'static str)],
+    /// The device whose pictures it takes in place, and the chain that brings them there.
+    pub(super) device: Option<(Kind, Chain)>,
+    /// It takes that device's pictures alone, so pictures in system memory go up to it first.
+    pub(super) device_only: bool,
+}
+
+#[cfg(not(target_os = "macos"))]
+const NVENC: Spec = Spec {
+    name: "h264_nvenc",
+    tune: &[("preset", "p1"), ("tune", "ull"), ("zerolatency", "1"), ("delay", "0"), ("rc", "cbr"), ("forced-idr", "1"), ("profile", "baseline")],
+    device: Some((Kind::CUDA, |w, h, full| format!("{}scale_cuda=w={w}:h={h}:format=nv12", if full { "colorspace_cuda=range=tv," } else { "" }))),
+    device_only: false,
+};
+#[cfg(not(target_os = "macos"))]
+const QSV: Spec = Spec {
+    name: "h264_qsv",
+    // Intel numbers constrained baseline 578, as FFmpeg does, and its own "baseline" is plain
+    tune: &[("preset", "veryfast"), ("async_depth", "1"), ("look_ahead", "0"), ("forced_idr", "1"), ("profile", "578")],
+    device: Some((QSV_FROM, |w, h, _| format!("hwmap=derive_device=qsv,format=qsv,vpp_qsv=w={w}:h={h}:format=nv12:out_range=limited"))),
+    device_only: false,
+};
+/// The device Quick Sync maps pictures from.
+#[cfg(windows)]
+const QSV_FROM: Kind = Kind::D3D11_INTEL;
+#[cfg(not(any(windows, target_os = "macos")))]
+const QSV_FROM: Kind = Kind::VAAPI;
+#[cfg(windows)]
+const AMF: Spec = Spec { name: "h264_amf", tune: &[("usage", "ultralowlatency"), ("quality", "speed"), ("profile", "constrained_baseline")], device: None, device_only: false };
+/// Media Foundation, held to a hardware encoder, since openh264 does software better.
+#[cfg(windows)]
+const MF: Spec = Spec { name: "h264_mf", tune: &[("hw_encoding", "1"), ("scenario", "display_remoting"), ("rate_control", "cbr")], device: None, device_only: false };
+#[cfg(not(any(windows, target_os = "macos")))]
+const VAAPI: Spec = Spec {
+    name: "h264_vaapi",
+    tune: &[("profile", "constrained_baseline"), ("coder", "cavlc"), ("rc_mode", "CBR"), ("async_depth", "1")],
+    device: Some((Kind::VAAPI, |w, h, _| format!("scale_vaapi=w={w}:h={h}:format=nv12:out_range=limited"))),
+    device_only: true,
+};
+/// The Raspberry Pi 4's encoder, which takes FFmpeg's profile number.
+#[cfg(not(any(windows, target_os = "macos")))]
+const V4L2: Spec = Spec { name: "h264_v4l2m2m", tune: &[("profile", "578")], device: None, device_only: false };
+#[cfg(target_os = "macos")]
+const VIDEOTOOLBOX: Spec = Spec { name: "h264_videotoolbox", tune: &[("realtime", "1"), ("profile", "baseline")], device: None, device_only: false };
+const OPENH264: Spec = Spec {
+    name: "libopenh264",
+    tune: &[("profile", "constrained_baseline"), ("allow_skip_frames", "0"), ("rc_mode", "bitrate")],
+    device: None,
+    device_only: false,
+};
+
+/// The H264 encoders tried, best first: each vendor's own, then the system's, then openh264.
+/// One that is full or missing falls through to the next. Vulkan's is left out: NVIDIA's
+/// makes High profile only, not the constrained baseline every browser decodes.
+#[cfg(windows)]
+pub(super) const ORDER: &[Spec] = &[NVENC, QSV, AMF, MF, OPENH264];
+#[cfg(target_os = "macos")]
+pub(super) const ORDER: &[Spec] = &[VIDEOTOOLBOX, OPENH264];
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(super) const ORDER: &[Spec] = &[NVENC, QSV, VAAPI, V4L2, OPENH264];
+
+/// The encoders to try: all of them, or only the one named.
+pub(super) fn specs(only: Option<&str>) -> impl Iterator<Item = &'static Spec> {
+    ORDER.iter().filter(move |s| only.is_none_or(|n| n == s.name))
 }
 
 /// An H264 encoder set for low latency: no B frames, no lookahead, constrained baseline,
@@ -33,23 +94,14 @@ pub struct Encoder {
 unsafe impl Send for Encoder {}
 
 impl Encoder {
-    /// The first encoder that opens at this size for pictures in system memory, or only the
-    /// one named. None when none does.
-    pub(super) fn open(width: u32, height: u32, fps: f64, colors: Colors, only: Option<&str>) -> Option<Encoder> {
-        names(only).into_iter().find_map(|name| Encoder::open_named(name, width, height, fps, colors, std::ptr::null_mut()))
-    }
-
-    /// The encoder named, taking pictures from a device's pool in place.
-    pub(super) fn open_on(name: &str, frames: *mut ffi::AVBufferRef, width: u32, height: u32, fps: f64, colors: Colors) -> Option<Encoder> {
-        if frames.is_null() { None } else { Encoder::open_named(name, width, height, fps, colors, frames) }
-    }
-
-    fn open_named(name: &str, width: u32, height: u32, fps: f64, colors: Colors, frames: *mut ffi::AVBufferRef) -> Option<Encoder> {
+    /// Opens one encoder at a size, for pictures in system memory or, given a device's pool,
+    /// for that pool's pictures. None when it does not open.
+    pub(super) fn open(spec: &Spec, width: u32, height: u32, fps: f64, colors: Colors, frames: Option<&Frames>) -> Option<Encoder> {
         let fps = if fps > 0.0 { fps } else { 30.0 };
-        if name == "h264_qsv" && cfg!(target_os = "linux") && !hw::have_vaapi() {
+        if spec.name == "h264_qsv" && cfg!(target_os = "linux") && !hw::have_vaapi() {
             return None;
         }
-        let cname = CString::new(name).ok()?;
+        let cname = CString::new(spec.name).ok()?;
         // SAFETY: a lookup in FFmpeg's static tables, then a fresh context set up before its
         // open and freed when the open fails. A pool reference is a hardware frames context
         unsafe {
@@ -63,10 +115,10 @@ impl Encoder {
             c.height = height as c_int;
             c.time_base = ffi::AVRational { num: 1, den: 1_000_000 };
             c.framerate = ffi::av_d2q(fps, 1000);
-            if let Some(pool) = frames.as_ref() {
-                let pool_ctx = &*(pool.data as *const ffi::AVHWFramesContext);
+            if let Some(pool) = frames {
+                let pool_ctx = &*((*pool.as_ptr()).data as *const ffi::AVHWFramesContext);
                 (c.pix_fmt, c.sw_pix_fmt) = (pool_ctx.format, pool_ctx.sw_format);
-                c.hw_frames_ctx = ffi::av_buffer_ref(frames);
+                c.hw_frames_ctx = ffi::av_buffer_ref(pool.as_ptr());
             } else {
                 c.pix_fmt = input_format(ctx, codec);
             }
@@ -74,7 +126,7 @@ impl Encoder {
             c.gop_size = ((fps * 2.0).round() as c_int).max(1);
             c.max_b_frames = 0;
             colors.stamp_encoder(c);
-            let mut options = Dict::of(tune(name));
+            let mut options = Dict::of(spec.tune);
             if ffi::avcodec_open2(ctx, codec, &mut options.0) == 0 {
                 return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, params: ParameterSets::default() });
             }
@@ -143,18 +195,6 @@ impl Drop for Encoder {
 /// About 0.08 bits a pixel.
 fn bitrate_for(width: u32, height: u32, fps: f64) -> i64 {
     ((width as f64 * height as f64 * fps.max(1.0) * 0.08) as i64).clamp(200_000, 40_000_000)
-}
-
-/// Each encoder's low latency settings. Constrained baseline decodes in every browser.
-fn tune(name: &str) -> &'static [(&'static str, &'static str)] {
-    match name {
-        "h264_nvenc" => &[("preset", "p1"), ("tune", "ull"), ("zerolatency", "1"), ("delay", "0"), ("rc", "cbr"), ("forced-idr", "1"), ("profile", "baseline")],
-        "h264_qsv" => &[("preset", "veryfast"), ("async_depth", "1"), ("look_ahead", "0"), ("forced_idr", "1"), ("profile", "baseline")],
-        "h264_amf" => &[("usage", "ultralowlatency"), ("quality", "speed"), ("profile", "constrained_baseline")],
-        "h264_videotoolbox" => &[("realtime", "1"), ("profile", "baseline")],
-        "libopenh264" => &[("profile", "constrained_baseline"), ("allow_skip_frames", "0"), ("rc_mode", "bitrate")],
-        _ => &[],
-    }
 }
 
 /// NV12 when the encoder takes it, since hardware encoders read it natively, else 4:2:0 planar.
