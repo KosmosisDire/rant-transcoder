@@ -1,7 +1,7 @@
 use std::ffi::{CString, c_void};
 use std::os::raw::c_int;
 
-use super::{Dict, Frame, Packet, PixelFormat, hw, static_text};
+use super::{Colors, Dict, Frame, Packet, PixelFormat, hw, static_text};
 use crate::annexb::ParameterSets;
 use crate::ffi;
 
@@ -18,6 +18,7 @@ const ORDER: &[&str] = &["h264_nvenc", "h264_qsv", "libopenh264"];
 /// parameter sets in front of every keyframe.
 pub struct Encoder {
     ctx: *mut ffi::AVCodecContext,
+    colors: Colors,
     packet: Packet,
     last_pts: i64,
     params: ParameterSets,
@@ -28,7 +29,7 @@ unsafe impl Send for Encoder {}
 
 impl Encoder {
     /// The first encoder that opens at this size, or only the one named. None when none does.
-    pub fn open(width: u32, height: u32, fps: f64, only: Option<&str>) -> Option<Encoder> {
+    pub fn open(width: u32, height: u32, fps: f64, colors: Colors, only: Option<&str>) -> Option<Encoder> {
         let fps = if fps > 0.0 { fps } else { 30.0 };
         let names: Vec<&str> = only.map_or(ORDER.to_vec(), |n| vec![n]);
         for name in names {
@@ -53,9 +54,10 @@ impl Encoder {
                 c.bit_rate = bitrate_for(width, height, fps);
                 c.gop_size = ((fps * 2.0).round() as c_int).max(1);
                 c.max_b_frames = 0;
+                colors.stamp_encoder(c);
                 let mut options = Dict::of(tune(name));
                 if ffi::avcodec_open2(ctx, codec, &mut options.0) == 0 {
-                    return Some(Encoder { ctx, packet: Packet::new(), last_pts: i64::MIN, params: ParameterSets::default() });
+                    return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, params: ParameterSets::default() });
                 }
                 ffi::avcodec_free_context(&mut ctx);
             }
@@ -74,6 +76,11 @@ impl Encoder {
 
     pub fn height(&self) -> u32 {
         self.raw().height as u32
+    }
+
+    /// The colours its stream signals.
+    pub fn colors(&self) -> Colors {
+        self.colors
     }
 
     /// The picture format it takes.

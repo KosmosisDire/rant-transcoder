@@ -12,7 +12,7 @@ use rant::types::{ExternalVideoStream, Timestamp, VideoCodec, VideoFrame, VideoS
 use rant::{Node, Publisher, Qos, RemoteVariable, Subscriber, VariableOptions};
 use tracing::{info, warn};
 
-use crate::av::{CodecId, CodecParameters, Decoder, Encoder, Frame, Scaler};
+use crate::av::{CodecId, CodecParameters, Colors, Decoder, Encoder, Frame, Scaler};
 use crate::rules::{PREVIEW_FPS, RateGate, RateMeter, needs_preview, preview_size};
 use crate::source::{Payload, Source, TopicSource, UrlSource};
 
@@ -266,16 +266,16 @@ struct Tier {
 }
 
 impl Tier {
-    /// Opens the encoder for a size when it is not open at that size already.
-    fn ready(&mut self, width: u32, height: u32, fps: f64, only: Option<&str>, child: &str) -> bool {
-        if self.encoder.as_ref().is_some_and(|e| e.width() == width && e.height() == height) {
+    /// Opens the encoder for a size and colours when it is not open for them already.
+    fn ready(&mut self, width: u32, height: u32, fps: f64, colors: Colors, only: Option<&str>, child: &str) -> bool {
+        if self.encoder.as_ref().is_some_and(|e| e.width() == width && e.height() == height && e.colors() == colors) {
             return true;
         }
         if self.failed == Some((width, height)) {
             return false;
         }
         self.encoder = None; // a GeForce counts the open sessions
-        self.encoder = Encoder::open(width, height, fps, only);
+        self.encoder = Encoder::open(width, height, fps, colors, only);
         match &self.encoder {
             Some(e) => info!("{child}: {width}x{height} at {fps:.1} fps with {}", e.name()),
             None => {
@@ -288,7 +288,7 @@ impl Tier {
 
     fn encode(&mut self, picture: &Frame, width: u32, height: u32, time_us: u64, key: &AtomicBool, out: impl FnMut(&[u8], bool)) {
         let Some(e) = &mut self.encoder else { return };
-        if let Some(f) = self.scaler.convert(picture, width, height, e.format()) {
+        if let Some(f) = self.scaler.convert(picture, width, height, e.format(), e.colors()) {
             e.encode(f, time_us, key.swap(false, Ordering::Relaxed), out);
         }
     }
@@ -458,15 +458,16 @@ impl Worker {
     /// Encodes one picture into the children that take it.
     fn encode(&mut self, tiers: &mut Tiers, picture: &Frame, to_video: bool, preview: bool, fps: f64, time_us: u64) {
         let (w, h) = (picture.width(), picture.height());
+        let colors = Colors::for_child(picture);
         let name = &self.parent.name;
-        if to_video && tiers.video.ready(w, h, fps, self.encoder.as_deref(), &format!("{name}/Video")) {
+        if to_video && tiers.video.ready(w, h, fps, colors, self.encoder.as_deref(), &format!("{name}/Video")) {
             let key = &self.flags.key_video;
             let out = &mut self.out;
             tiers.video.encode(picture, w, h, time_us, key, |data, k| publish(&self.shared, out, false, data, k, w, h, time_us));
         }
         if preview && tiers.gate.pass(time_us) {
             let (pw, ph) = preview_size(w, h);
-            if tiers.preview.ready(pw, ph, fps.min(PREVIEW_FPS), self.encoder.as_deref(), &format!("{name}/Preview")) {
+            if tiers.preview.ready(pw, ph, fps.min(PREVIEW_FPS), colors, self.encoder.as_deref(), &format!("{name}/Preview")) {
                 let key = &self.flags.key_preview;
                 let out = &mut self.out;
                 tiers.preview.encode(picture, pw, ph, time_us, key, |data, k| publish(&self.shared, out, true, data, k, pw, ph, time_us));

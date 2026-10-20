@@ -33,7 +33,7 @@ impl Frame {
         PixelFormat(self.raw().format)
     }
 
-    fn raw(&self) -> &ffi::AVFrame {
+    pub(super) fn raw(&self) -> &ffi::AVFrame {
         // SAFETY: the frame lives as long as self
         unsafe { self.ptr.as_ref() }
     }

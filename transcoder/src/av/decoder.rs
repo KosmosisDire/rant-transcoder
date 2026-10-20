@@ -26,16 +26,7 @@ impl Decoder {
     /// `params` carries a demuxed stream's extradata, None for a Rant topic. None when no
     /// decoder opens.
     pub fn open(codec: CodecId, params: Option<&CodecParameters>) -> Option<Decoder> {
-        let mut d = Decoder {
-            ctx: std::ptr::null_mut(),
-            codec,
-            params: params.cloned(),
-            packet: Packet::new(),
-            frame: Frame::new(),
-            download: Frame::new(),
-            hw: ffi::AV_PIX_FMT_NONE,
-            errors: 0,
-        };
+        let mut d = Decoder::closed(codec, params);
         // SAFETY: a lookup in FFmpeg's static tables
         let native = unsafe { ffi::avcodec_find_decoder(codec.0) };
         if !native.is_null() {
@@ -52,6 +43,25 @@ impl Decoder {
             }
         }
         d.open_software().then_some(d)
+    }
+
+    /// The same in software only.
+    pub fn software(codec: CodecId, params: Option<&CodecParameters>) -> Option<Decoder> {
+        let mut d = Decoder::closed(codec, params);
+        d.open_software().then_some(d)
+    }
+
+    fn closed(codec: CodecId, params: Option<&CodecParameters>) -> Decoder {
+        Decoder {
+            ctx: std::ptr::null_mut(),
+            codec,
+            params: params.cloned(),
+            packet: Packet::new(),
+            frame: Frame::new(),
+            download: Frame::new(),
+            hw: ffi::AV_PIX_FMT_NONE,
+            errors: 0,
+        }
     }
 
     fn open_software(&mut self) -> bool {
@@ -129,7 +139,10 @@ impl Decoder {
                 let downloaded = self.hw != ffi::AV_PIX_FMT_NONE && (*self.frame.as_ptr()).format == self.hw;
                 if downloaded {
                     self.download.unref();
-                    if ffi::av_hwframe_transfer_data(self.download.as_mut_ptr(), self.frame.as_ptr(), 0) < 0 {
+                    // the transfer moves pixels only, and the range and matrix must come along
+                    if ffi::av_hwframe_transfer_data(self.download.as_mut_ptr(), self.frame.as_ptr(), 0) < 0
+                        || ffi::av_frame_copy_props(self.download.as_mut_ptr(), self.frame.as_ptr()) < 0
+                    {
                         self.frame.unref();
                         return self.fail();
                     }

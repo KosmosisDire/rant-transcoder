@@ -1,5 +1,6 @@
 //! The safe layer over FFmpeg. Nothing outside this module touches `ffi`.
 
+mod color;
 mod decoder;
 mod encoder;
 mod frame;
@@ -7,6 +8,7 @@ mod hw;
 mod input;
 mod scaler;
 
+pub use color::Colors;
 pub use decoder::Decoder;
 pub use encoder::Encoder;
 pub use frame::{Frame, Layout, Wrapped};
