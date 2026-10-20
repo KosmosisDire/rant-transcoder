@@ -38,6 +38,20 @@ impl Frame {
         unsafe { self.ptr.as_ref() }
     }
 
+    pub(super) fn as_ptr(&self) -> *const ffi::AVFrame {
+        self.ptr.as_ptr()
+    }
+
+    pub(super) fn as_mut_ptr(&mut self) -> *mut ffi::AVFrame {
+        self.ptr.as_ptr()
+    }
+
+    /// Drops the buffers the frame holds and resets its fields.
+    pub(super) fn unref(&mut self) {
+        // SAFETY: the frame is ours, and a borrowed picture is never in it here since Wrapped holds it mutably
+        unsafe { ffi::av_frame_unref(self.ptr.as_ptr()) };
+    }
+
     /// Points the frame at raw pixels without copying them, for as long as the borrow lasts.
     /// None when the layout is not one FFmpeg reads or `data` is too short to hold it.
     pub fn wrap<'a>(&'a mut self, data: &'a [u8], layout: Layout) -> Option<Wrapped<'a>> {

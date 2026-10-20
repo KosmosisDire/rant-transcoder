@@ -17,5 +17,9 @@ if-addrs = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# only to look for libva before FFmpeg's VAAPI calls abort on its absence
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.9"
+
 [build-dependencies]
 sha2 = "0.10"
