@@ -14,6 +14,8 @@ fn main() {
     // the target folder, which cargo marks with CACHEDIR.TAG, keeps one download for every profile
     let cache = out.ancestors().find(|p| p.join("CACHEDIR.TAG").is_file()).unwrap_or(&out).join("ffmpeg");
     let dir = ffmpeg_dir(&os, &arch, &cache).unwrap_or_else(|e| panic!("rant-transcoder: {e}"));
+    // a removed or changed FFmpeg is fetched and placed again
+    println!("cargo:rerun-if-changed={}", dir.display());
     // the tests make their clips with this FFmpeg's own ffmpeg tool
     println!("cargo:rustc-env=TRANSCODER_FFMPEG_DIR={}", dir.display());
     println!("cargo:rustc-link-search=native={}", dir.join("lib").display());
