@@ -13,6 +13,7 @@ path = "src/main.rs"
 rant = { package = "rant-middleware", git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.32" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
 if-addrs = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
