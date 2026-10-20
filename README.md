@@ -2,6 +2,14 @@
 
 Republishes the video on this host's Rant nodes as H264 any viewer can play.
 
-```sh
-cargo run --release
 ```
+rant install transcoder
+```
+
+## Build
+
+```
+cargo build --release
+```
+
+The first build fetches the pinned LGPL FFmpeg 8.1, whose libraries ship beside the exe.

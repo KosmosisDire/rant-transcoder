@@ -1,0 +1,7 @@
+name        = "transcoder"
+description = "Republishes this host's video as H264 any viewer can play, only where that changes it"
+archive     = "rant-transcoder-${version}-${platform}.tar.gz"
+
+node "transcoder" {
+  run = "${path.package}/bin/rant-transcoder"
+}
