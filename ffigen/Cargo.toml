@@ -1,0 +1,11 @@
+[package]
+name = "rant-transcoder-ffigen"
+version = "0.0.1"
+edition = "2024"
+description = "Regenerates the transcoder's FFmpeg declarations from the pinned FFmpeg headers"
+publish = false
+
+[dependencies]
+# Pinned exactly, as Rant's own ffigen: another bindgen spells the same header differently
+bindgen = { version = "=0.73.2", default-features = false, features = ["runtime", "prettyplease"] }
+sha2 = "0.10"

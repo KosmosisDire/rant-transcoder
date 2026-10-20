@@ -1,0 +1,5 @@
+[workspace]
+members = ["transcoder", "ffigen"]
+# ffigen needs libclang, so a plain cargo build leaves it out
+default-members = ["transcoder"]
+resolver = "3"
