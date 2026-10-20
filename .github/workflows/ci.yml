@@ -39,8 +39,6 @@ jobs:
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Lint
         run: cargo clippy --locked --release --all-targets -- -D warnings
 
