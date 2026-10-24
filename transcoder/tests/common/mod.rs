@@ -193,6 +193,46 @@ impl Drop for Camera {
     }
 }
 
+/// A camera node with nothing but `Test/Solo`, 480p Bgr8 at 20 fps, as a plain camera is.
+pub struct SoloCamera {
+    _node: Node,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SoloCamera {
+    pub fn start() -> SoloCamera {
+        let node = Node::new("solo", local()).unwrap();
+        let schema = node.schema("Image").unwrap();
+        let solo = node.publisher::<Bytes>("Test/Solo", Qos::new().schema(&schema)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut m = MessageBuilder::new(&schema);
+            m.set_uint("width", 640).unwrap().set_uint("height", 480).unwrap().set_enum("format", "Bgr8").unwrap();
+            let mut pic = vec![0u8; 640 * 480 * 3];
+            paint(&mut pic, 640, 0..480, 0);
+            m.set_array("data", &pic).unwrap();
+            let mut next = Instant::now();
+            while !stopped.load(Ordering::Relaxed) {
+                let _ = solo.send_captured(m.bytes(), Timestamp { us: wall_us() as i64 });
+                next += Duration::from_millis(50);
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+        });
+        SoloCamera { _node: node, stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for SoloCamera {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// What the viewer saw on one child.
 #[derive(Default)]
 pub struct Watch {
