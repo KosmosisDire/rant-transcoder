@@ -1,6 +1,6 @@
 [package]
 name = "rant-transcoder"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 description = "Republishes the video on this host's Rant nodes as H264 any viewer can play"
 publish = false
@@ -10,7 +10,7 @@ name = "rant-transcoder"
 path = "src/main.rs"
 
 [dependencies]
-rant = { package = "rant-middleware", git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.35" }
+rant = { package = "rant-middleware", git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.36" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
