@@ -195,4 +195,26 @@ mod tests {
             assert_eq!(size, Some((vw, vh)), "{w}x{h} through {}", o.describe());
         }
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_foundation_opens_on_threads_at_once() {
+        // 8x6 is too small, so each open fails and closes again, as on a host with no GPU
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let pixels = vec![128u8; 8 * 6];
+                    let mut raw = Frame::new();
+                    let wrapped = raw.wrap(&pixels, Layout { width: 8, height: 6, stride: 0, format: PixelFormat::GRAY8 }).unwrap();
+                    let picture = Picture::new(Pool::default().own(&wrapped).unwrap());
+                    for _ in 0..10 {
+                        assert!(Output::open(&picture, 8, 6, 30.0, Some("h264_mf"), &[]).is_none());
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
 }

@@ -1,5 +1,6 @@
 use std::ffi::{CString, c_void};
 use std::os::raw::c_int;
+use std::sync::Mutex;
 
 use super::hw::{self, Frames, Kind};
 use super::{Colors, Dict, Error, Frame, Packet, PixelFormat, static_text};
@@ -93,6 +94,10 @@ pub struct Encoder {
 // SAFETY: the context belongs to this encoder alone
 unsafe impl Send for Encoder {}
 
+/// Held while an encoder opens or closes. Media Foundation unloads the GPU driver on close,
+/// which crashes or hangs another thread opening one at the same time.
+static OPENING: Mutex<()> = Mutex::new(());
+
 impl Encoder {
     /// Opens one encoder at a size, for pictures in system memory or, given a device's pool,
     /// for that pool's pictures. None when it does not open.
@@ -102,6 +107,7 @@ impl Encoder {
             return None;
         }
         let cname = CString::new(spec.name).ok()?;
+        let _one = OPENING.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a lookup in FFmpeg's static tables, then a fresh context set up before its
         // open and freed when the open fails. A pool reference is a hardware frames context
         unsafe {
@@ -191,6 +197,7 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
+        let _one = OPENING.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: ours alone
         unsafe { ffi::avcodec_free_context(&mut self.ctx) };
     }
