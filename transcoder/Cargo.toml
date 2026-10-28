@@ -1,6 +1,6 @@
 [package]
 name = "rant-transcoder"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 description = "Republishes the video on this host's Rant nodes as H264 any viewer can play"
 publish = false
