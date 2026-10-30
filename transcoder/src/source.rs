@@ -25,8 +25,8 @@ pub enum Payload<'a> {
 }
 
 pub trait Source: Send {
-    /// The next unit, None when none came in time. A URL blocks until a unit, the stop flag
-    /// or a 10 s stall, whatever `timeout` says.
+    /// The next unit, None when none came in time. A URL blocks until a unit, a cancel or a
+    /// stall, whatever `timeout` says.
     fn read(&mut self, timeout: Duration) -> Option<Unit<'_>>;
 
     /// A URL that ended or failed, to be opened again.

@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 use super::{CodecId, CodecParameters, Dict, Error, Packet};
 use crate::ffi;
 
-/// How long a blocking open or read may go without an answer.
-const STALL: Duration = Duration::from_secs(10);
+/// How long an open may go without an answer.
+const OPEN_STALL: Duration = Duration::from_secs(10);
+/// How long a live stream may go without a picture before it counts as hung.
+const READ_STALL: Duration = Duration::from_secs(5);
+/// How long closing may take, which tells the server the session is over.
+const GOODBYE: Duration = Duration::from_secs(1);
 
 /// Asked often during a blocking call, which ends once it says true.
 pub type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -41,22 +45,27 @@ struct Wait {
     cancel: Cancel,
     deadline: Cell<Instant>,
     timed_out: Cell<bool>,
+    closing: Cell<bool>,
 }
 
 impl Wait {
-    fn arm(&self) {
-        self.deadline.set(Instant::now() + STALL);
+    fn arm(&self, stall: Duration) {
+        self.deadline.set(Instant::now() + stall);
     }
 
     /// FFmpeg reports our own deadline as an exit request, which says nothing to a reader.
     fn why(&self, code: c_int) -> String {
-        if self.timed_out.get() { format!("no answer within {} s", STALL.as_secs()) } else { Error(code).to_string() }
+        if self.timed_out.get() { "no answer in time".to_owned() } else { Error(code).to_string() }
     }
 }
 
 unsafe extern "C" fn interrupted(opaque: *mut c_void) -> c_int {
     // SAFETY: opaque is the input's boxed Wait, alive while any call on the input runs
     let w = unsafe { &*(opaque as *const Wait) };
+    // a cancel must not cut off the goodbye, or a camera holds the session until it times out
+    if w.closing.get() {
+        return (Instant::now() > w.deadline.get()) as c_int;
+    }
     if (w.cancel)() {
         return 1;
     }
@@ -68,7 +77,7 @@ impl Input {
     /// Opens `url` with demuxer options, `format` naming the demuxer when probing cannot
     /// tell. `cancel` interrupts a blocking open or read.
     pub fn open(url: &str, format: Option<&str>, options: &[(&str, &str)], cancel: Cancel) -> Result<Input, String> {
-        let wait = Box::new(Wait { cancel, deadline: Cell::new(Instant::now() + STALL), timed_out: Cell::new(false) });
+        let wait = Box::new(Wait { cancel, deadline: Cell::new(Instant::now() + OPEN_STALL), timed_out: Cell::new(false), closing: Cell::new(false) });
         let curl = CString::new(url).map_err(|_| "the URL holds a nul byte".to_string())?;
         // SAFETY: a fresh context whose interrupt points at the boxed wait, which the Input keeps
         unsafe {
@@ -84,7 +93,7 @@ impl Input {
                 return Err(wait.why(r)); // the failed open freed the context
             }
             let mut input = Input { fmt, bsf: std::ptr::null_mut(), packet: Packet::new(), index: -1, codec: CodecId::NONE, fps: 0.0, wait };
-            input.wait.arm();
+            input.wait.arm(OPEN_STALL);
             let r = ffi::avformat_find_stream_info(fmt, std::ptr::null_mut());
             if r < 0 {
                 return Err(input.wait.why(r));
@@ -139,10 +148,13 @@ impl Input {
         unsafe { *(*self.fmt).streams.add(self.index as usize) }
     }
 
-    /// The next unit of the video stream. Err when the stream ended or failed, or stalled
-    /// for 10 s.
+    /// The next unit of the video stream. Err when the stream ended or failed, or stalled.
     pub fn read(&mut self) -> Result<InputPacket<'_>, String> {
         self.packet.unref();
+        // the read a stall ended gave the frame a parser held and said nothing was wrong
+        if self.wait.timed_out.get() {
+            return Err(self.wait.why(0));
+        }
         // SAFETY: the packet is ours between reads, and the filter takes its reference on a send
         unsafe {
             loop {
@@ -155,7 +167,7 @@ impl Input {
                         return Err(self.wait.why(r));
                     }
                 }
-                self.wait.arm();
+                self.wait.arm(READ_STALL);
                 let r = ffi::av_read_frame(self.fmt, self.packet.as_ptr());
                 if r < 0 {
                     return Err(self.wait.why(r));
@@ -183,6 +195,8 @@ impl Input {
 
 impl Drop for Input {
     fn drop(&mut self) {
+        self.wait.closing.set(true);
+        self.wait.deadline.set(Instant::now() + GOODBYE);
         // SAFETY: ours alone, the filter's null is fine
         unsafe {
             ffi::av_bsf_free(&mut self.bsf);
