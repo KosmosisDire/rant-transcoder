@@ -41,6 +41,9 @@ pub struct Parent {
     pub peer: u32,
 }
 
+/// A source that ends sooner than this waits as long before it opens again.
+const SHORTEST_LIFE: Duration = Duration::from_secs(2);
+
 /// Rant's name limit, which a child's name must also fit.
 const NAME_MAX: usize = 64;
 
@@ -307,6 +310,7 @@ impl Worker {
         let (mut width, mut height) = (0, 0); // the latest picture size, decoded or stated
         let mut h264 = false; // the source arrives as H264
         let began = Instant::now();
+        let mut opened = began;
         let mut last_measure = began;
         let rate = |meter: &RateMeter, stated: f64| if meter.count() >= 2 { meter.fps() } else { stated };
 
@@ -322,7 +326,13 @@ impl Worker {
             }
 
             let external = self.parent.origin.external();
-            if src.as_ref().is_none_or(|s| s.ended()) || (external && generation != self.flags.generation.load(Ordering::Relaxed)) {
+            let moved = external && generation != self.flags.generation.load(Ordering::Relaxed);
+            let ended = src.as_ref().is_some_and(|s| s.ended());
+            if ended && !moved && opened.elapsed() < SHORTEST_LIFE {
+                self.pause(SHORTEST_LIFE - opened.elapsed(), generation);
+                continue;
+            }
+            if src.is_none() || ended || moved {
                 src = None;
                 dec = None;
                 synced = false;
@@ -331,6 +341,7 @@ impl Worker {
                         params = s.parameters();
                         stated_fps = s.stated_fps();
                         src = Some(s);
+                        opened = Instant::now();
                         told_open = false;
                     }
                     Err(why) => {
