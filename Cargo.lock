@@ -446,8 +446,8 @@ dependencies = [
 
 [[package]]
 name = "rant-macros"
-version = "0.0.36"
-source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.36#88b50fa0874bc486c5f77bf51e59f6d912d8cb50"
+version = "0.0.38"
+source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.38#8beb2fbad8f682b39b740727675be7e2f84284dd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -456,8 +456,8 @@ dependencies = [
 
 [[package]]
 name = "rant-middleware"
-version = "0.0.36"
-source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.36#88b50fa0874bc486c5f77bf51e59f6d912d8cb50"
+version = "0.0.38"
+source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.38#8beb2fbad8f682b39b740727675be7e2f84284dd"
 dependencies = [
  "cc",
  "rant-macros",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "rant-transcoder"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "clap",
