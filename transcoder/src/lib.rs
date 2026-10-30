@@ -13,6 +13,8 @@ pub mod stream;
 mod ffi;
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +38,7 @@ pub struct Options {
 /// Watches the mesh for video published on this host and keeps a Stream for each.
 pub struct Transcoder {
     node: Arc<Node>,
+    domain: u16,
     encoder: Option<String>,
     streams: HashMap<String, Stream>,
     /// Counts live workers, each holding a clone.
@@ -74,11 +77,12 @@ impl Transcoder {
             warn!("rant: {text}");
             told.insert(text, now);
         });
-        Ok(Transcoder { node: Arc::new(node), encoder: options.encoder, streams: HashMap::new(), workers: Arc::new(()), epoch: 0 })
+        Ok(Transcoder { node: Arc::new(node), domain: options.domain, encoder: options.encoder, streams: HashMap::new(), workers: Arc::new(()), epoch: 0 })
     }
 
     /// Runs until `stop` says so, then closes every stream.
     pub fn run(&mut self, stop: impl Fn() -> bool) {
+        let Some(_host) = self.wait_for_host(&stop) else { return };
         let mut next_scan = Instant::now();
         while !stop() {
             let now = Instant::now();
@@ -105,6 +109,41 @@ impl Transcoder {
         while Arc::strong_count(&self.workers) > 1 && from.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Waits until this transcoder is the one serving its domain on this host. None when told to
+    /// stop first. The system frees the lock the moment its holder dies, however it dies.
+    fn wait_for_host(&self, stop: impl Fn() -> bool) -> Option<Option<File>> {
+        let file = match host_lock_file(self.domain) {
+            Ok(file) => file,
+            Err(e) => {
+                warn!("cannot tell whether another transcoder runs on this host: {e}");
+                return Some(None);
+            }
+        };
+        let mut told = false;
+        while !stop() {
+            match file.try_lock() {
+                Ok(()) => {
+                    if told {
+                        info!("the other transcoder went, this one takes over");
+                    }
+                    return Some(Some(file));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if !told {
+                        info!("another transcoder serves this domain on this host, waiting for it to go");
+                    }
+                    told = true;
+                }
+                Err(TryLockError::Error(e)) => {
+                    warn!("cannot tell whether another transcoder runs on this host: {e}");
+                    return Some(None);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        None
     }
 
     fn scan(&mut self) {
@@ -147,6 +186,16 @@ impl Transcoder {
             }
         }
     }
+}
+
+/// The file whose lock says who serves a domain on this host, in a folder every user shares, so
+/// a service and someone's own run see the same one.
+fn host_lock_file(domain: u16) -> std::io::Result<File> {
+    let domain = if domain != 0 { domain } else { std::env::var("RANT_DOMAIN").ok().and_then(|d| d.parse().ok()).unwrap_or(0) };
+    let dir = std::env::var_os("ProgramData").map_or_else(std::env::temp_dir, PathBuf::from);
+    let path = dir.join(format!("rant-transcoder-{domain}.lock"));
+    // another user's file opens to read only, which still locks
+    OpenOptions::new().create(true).truncate(false).write(true).open(&path).or_else(|_| File::open(&path))
 }
 
 /// What an entity gives a stream, None when nothing.
