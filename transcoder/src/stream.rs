@@ -375,10 +375,18 @@ impl Worker {
                         self.publish(false, data, key, width, height, u.time_us);
                     }
                     if (video && !pass) || preview || width == 0 {
+                        // a topic may change its codec at any frame
+                        if dec.as_ref().is_some_and(|d| d.codec() != codec) {
+                            dec = None;
+                            synced = false;
+                        }
                         if !dec.as_ref().is_some_and(Decoder::is_open) {
-                            dec = Decoder::open(codec, params.as_ref(), self.encoder.as_deref());
+                            dec = Decoder::open(codec, params.as_ref().filter(|p| p.codec() == codec), self.encoder.as_deref());
                             match &dec {
-                                Some(d) => info!("{}: decoding with {}", self.parent.name, d.describe()),
+                                Some(d) => {
+                                    info!("{}: decoding with {}", self.parent.name, d.describe());
+                                    told_decode = false;
+                                }
                                 None => {
                                     if !told_decode {
                                         warn!("{}: no decoder for {}", self.parent.name, codec.name());

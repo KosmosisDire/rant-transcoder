@@ -105,6 +105,11 @@ impl Decoder {
         true
     }
 
+    /// The bitstream it decodes.
+    pub fn codec(&self) -> CodecId {
+        self.codec
+    }
+
     /// False once the decoder has given up, after which it must be opened again.
     pub fn is_open(&self) -> bool {
         !self.ctx.is_null()
