@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::av::{Cancel, CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
 use crate::child::{Child, Job};
 use crate::rules::{RateMeter, needs_preview};
-use crate::source::{Payload, Source, TopicSource, UrlSource};
+use crate::source::{Locals, Payload, Source, TopicSource, UrlSource};
 
 /// What a parent carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,13 +32,12 @@ impl Origin {
     }
 }
 
-/// One local entity the mesh scan found: a topic of pictures, or a stream descriptor.
+/// One local entity the mesh scan found: a topic of pictures, or a stream descriptor. Its
+/// publisher may change, as when a camera restarts, with no change to the stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Parent {
     pub name: String,
     pub origin: Origin,
-    /// The local publisher or owner.
-    pub peer: u32,
 }
 
 /// How often a topic nobody watches is measured again, which only a size change needs.
@@ -115,6 +114,7 @@ pub struct Stream {
     node: Arc<Node>,
     parent: Parent,
     encoder: Option<String>,
+    locals: Locals,
     /// Counts live workers, so the transcoder can wait for them at its end.
     workers: Arc<()>,
     /// The name leaves no room for a child's.
@@ -134,13 +134,14 @@ pub struct Stream {
 
 impl Stream {
     /// `taken` says which of its children another node publishes already.
-    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, workers: Arc<()>, taken: [bool; 2]) -> Stream {
+    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, locals: Locals, workers: Arc<()>, taken: [bool; 2]) -> Stream {
         let shared = Arc::new(Mutex::new(Shared { video: None, preview: None, taken, shape: None, url: String::new(), kind: VideoStreamKind::Rtsp }));
         let mut s = Stream {
             node,
             skip: parent.name.len() + "/Preview".len() > NAME_MAX,
             parent,
             encoder,
+            locals,
             workers,
             shared,
             flags: Arc::default(),
@@ -263,6 +264,7 @@ impl Stream {
             node: self.node.clone(),
             parent: self.parent.clone(),
             encoder: self.encoder.clone(),
+            locals: self.locals.clone(),
             shared: self.shared.clone(),
             flags: self.flags.clone(),
             out: VideoFrame { codec: VideoCodec::H264, ..VideoFrame::default() },
@@ -327,6 +329,7 @@ struct Worker {
     node: Arc<Node>,
     parent: Parent,
     encoder: Option<String>,
+    locals: Locals,
     shared: Arc<Mutex<Shared>>,
     flags: Arc<Flags>,
     /// The reused outgoing message.
@@ -492,7 +495,7 @@ impl Worker {
     fn open(&self, generation: &mut u32) -> Result<Box<dyn Source>, String> {
         if !self.parent.origin.external() {
             let name = absolute(&self.parent.name);
-            let s = TopicSource::open(&self.node, &name, self.parent.origin == Origin::Image, self.parent.peer);
+            let s = TopicSource::open(&self.node, &name, self.parent.origin == Origin::Image, self.locals.clone());
             return s.map(|s| Box::new(s) as Box<dyn Source>).map_err(|e| e.to_string());
         }
         // the generation first, so a URL set meanwhile reopens rather than goes unseen

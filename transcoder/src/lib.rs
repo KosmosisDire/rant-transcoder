@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use rant::{Entity, EntityKind, Node, NodeOptions};
 use tracing::{info, warn};
 
+use source::Locals;
 use stream::{Origin, Parent, Stream};
 
 /// The node's name. Every transcoder's node is skipped as a source, so two never feed each other.
@@ -41,6 +42,7 @@ pub struct Transcoder {
     domain: u16,
     encoder: Option<String>,
     streams: HashMap<String, Stream>,
+    locals: Locals,
     /// Counts live workers, each holding a clone.
     workers: Arc<()>,
     epoch: u32,
@@ -77,7 +79,7 @@ impl Transcoder {
             warn!("rant: {text}");
             told.insert(text, now);
         });
-        Ok(Transcoder { node: Arc::new(node), domain: options.domain, encoder: options.encoder, streams: HashMap::new(), workers: Arc::new(()), epoch: 0 })
+        Ok(Transcoder { node: Arc::new(node), domain: options.domain, encoder: options.encoder, streams: HashMap::new(), locals: Locals::default(), workers: Arc::new(()), epoch: 0 })
     }
 
     /// Runs until `stop` says so, then closes every stream.
@@ -150,22 +152,27 @@ impl Transcoder {
         let r = self.node.reflection();
         let hosts = hosts::host_addresses();
         let mut found: HashMap<String, Parent> = HashMap::new();
+        let mut locals: HashSet<u32> = HashSet::new();
         let mut others: HashSet<String> = HashSet::new();
         for p in r.peers() {
             if !p.active || p.name == NODE {
                 continue;
             }
             let local = hosts::address_ip(&p.address).is_some_and(|ip| hosts.contains(&ip));
+            if local {
+                locals.insert(p.id);
+            }
             for e in r.entities(p.id) {
                 if e.provides {
                     others.insert(e.name.clone());
                 }
                 if local && let Some(origin) = origin_of(&e) {
                     // the first local publisher wins
-                    found.entry(e.name.clone()).or_insert(Parent { name: e.name, origin, peer: p.id });
+                    found.entry(e.name.clone()).or_insert(Parent { name: e.name, origin });
                 }
             }
         }
+        *self.locals.lock().unwrap_or_else(|e| e.into_inner()) = locals;
         self.streams.retain(|name, s| {
             let keep = found.get(name) == Some(s.parent());
             if !keep {
@@ -177,7 +184,7 @@ impl Transcoder {
             if !self.streams.contains_key(&name) {
                 info!("{name}: found on this host");
                 let taken = taken_children(&name, &others);
-                self.streams.insert(name, Stream::new(self.node.clone(), parent, self.encoder.clone(), self.workers.clone(), taken));
+                self.streams.insert(name, Stream::new(self.node.clone(), parent, self.encoder.clone(), self.locals.clone(), self.workers.clone(), taken));
             }
         }
         for (name, s) in &mut self.streams {

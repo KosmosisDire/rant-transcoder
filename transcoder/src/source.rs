@@ -1,5 +1,7 @@
 //! Where a stream's units come from: a Rant topic on this host, or a URL through FFmpeg.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rant::types::{ImageFormat, VideoCodec, VideoStreamKind};
@@ -7,6 +9,9 @@ use rant::{Bytes, MessageView, Node, Qos, Subscriber};
 
 use crate::annexb;
 use crate::av::{Cancel, CodecId, CodecParameters, Frame, Input, Layout, PixelFormat, Wrapped};
+
+/// This host's peers, which the mesh scan keeps up to date. Only their messages count.
+pub type Locals = Arc<Mutex<HashSet<u32>>>;
 
 /// One step of input: a raw picture, or one coded access unit.
 pub struct Unit<'a> {
@@ -62,20 +67,20 @@ const RAW: [(ImageFormat, PixelFormat); 8] = [
     (ImageFormat::Monof32, PixelFormat::GRAYF32LE),
 ];
 
-/// An Image or VideoFrame topic, taking messages from one publisher only. An Image source
-/// reads the newest picture, a VideoFrame one every frame.
+/// An Image or VideoFrame topic, taking messages from this host's publishers only. An Image
+/// source reads the newest picture, a VideoFrame one every frame.
 pub struct TopicSource {
     sub: Subscriber<Bytes>,
     image: bool,
-    publisher: u32,
+    locals: Locals,
     picture: Frame,
 }
 
 impl TopicSource {
-    pub fn open(node: &Node, name: &str, image: bool, publisher: u32) -> Result<TopicSource, rant::Error> {
+    pub fn open(node: &Node, name: &str, image: bool, locals: Locals) -> Result<TopicSource, rant::Error> {
         // every coded frame matters to the decoder, so hold a burst. A raw reader keeps only the newest
         let qos = Qos::new().reflect_from_mesh(true).queue_bytes(if image { 0 } else { 16 << 20 });
-        Ok(TopicSource { sub: node.pulled_subscriber::<Bytes>(name, qos)?, image, publisher, picture: Frame::new() })
+        Ok(TopicSource { sub: node.pulled_subscriber::<Bytes>(name, qos)?, image, locals, picture: Frame::new() })
     }
 }
 
@@ -83,7 +88,7 @@ impl Source for TopicSource {
     fn read(&mut self, timeout: Duration) -> Option<Unit<'_>> {
         let m = if self.image { self.sub.take_latest(timeout) } else { self.sub.take(timeout) }.ok().flatten()?;
         // a remote publisher of the same name is skipped, only this host's is ours
-        if m.publisher_id() != self.publisher {
+        if !self.locals.lock().unwrap_or_else(|e| e.into_inner()).contains(&m.publisher_id()) {
             return None;
         }
         let time_us = [m.capture_us(), m.written_us()].into_iter().find(|&t| t != 0).unwrap_or_else(wall_us);
