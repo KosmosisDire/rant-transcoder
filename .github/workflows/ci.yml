@@ -110,8 +110,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          at="$(gh api "repos/$GITHUB_REPOSITORY/commits/v${{ needs.plan.outputs.version }}" --jq .sha 2>/dev/null || true)"
-          test -z "$at" || test "$at" = "$GITHUB_SHA"
+          # gh prints the error body on a miss, so only a found tag is compared
+          if at="$(gh api "repos/$GITHUB_REPOSITORY/commits/v${{ needs.plan.outputs.version }}" --jq .sha 2>/dev/null)"; then
+            test "$at" = "$GITHUB_SHA"
+          fi
 
       - uses: actions/download-artifact@v8
         with:
