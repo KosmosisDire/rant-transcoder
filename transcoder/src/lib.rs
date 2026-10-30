@@ -19,13 +19,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rant::{Entity, EntityKind, Node, NodeOptions};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use source::Locals;
 use stream::{Origin, Parent, Stream};
 
 /// The node's name. Every transcoder's node is skipped as a source, so two never feed each other.
 pub const NODE: &str = "transcoder";
+
+/// How long one step of work may take, past any timeout of a read, an open or a queue for the
+/// encoder lock.
+const STUCK_MS: u64 = 180_000;
 
 pub struct Options {
     /// 0 takes RANT_DOMAIN, else 0.
@@ -86,8 +90,15 @@ impl Transcoder {
     pub fn run(&mut self, stop: impl Fn() -> bool) {
         let Some(_host) = self.wait_for_host(&stop) else { return };
         let mut next_scan = Instant::now();
+        let mut last_pass = Instant::now();
+        let mut no_judging_until = 0;
         while !stop() {
             let now = Instant::now();
+            // the machine slept or everything starved: no thread had its chance, so judge none
+            if now - last_pass > Duration::from_secs(5) {
+                no_judging_until = stream::clock_ms() + STUCK_MS;
+            }
+            last_pass = now;
             let epoch = self.node.reflection().epoch();
             // the epoch moves on every change, so a busy mesh still scans at most twice a second
             if (epoch != self.epoch && now + Duration::from_millis(1500) >= next_scan) || now >= next_scan {
@@ -97,6 +108,15 @@ impl Transcoder {
             }
             for s in self.streams.values_mut() {
                 s.tick();
+            }
+            let clock = stream::clock_ms();
+            if clock > no_judging_until
+                && let Some((name, _)) = self.streams.iter().find(|(_, s)| s.stuck(clock, STUCK_MS))
+            {
+                // a driver call that never returns holds its thread and any lock for good, and
+                // only a new process gets the device back. The service that runs this restarts it
+                error!("{name}: a thread has been stuck for {} s, exiting so a new process can take over", STUCK_MS / 1000);
+                std::process::exit(3);
             }
             // everything here is quick, so a slow pass means a stream holds up the others
             let took = now.elapsed();

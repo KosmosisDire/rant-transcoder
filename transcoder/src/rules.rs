@@ -1,6 +1,7 @@
 //! Each child's size, when a preview exists, and the rates both children are judged by.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The preview: the source scaled to fit 1280x720, at most 24 fps.
 pub const PREVIEW_WIDTH: u32 = 1280;
@@ -67,6 +68,26 @@ impl RateGate {
         };
         self.next = Some(next);
         true
+    }
+}
+
+/// How long a thread has been at one step of its work, for spotting one stuck in a driver,
+/// which no timeout reaches. Times are milliseconds on any clock that only rises, 0 for idle.
+#[derive(Default)]
+pub struct Busy(AtomicU64);
+
+impl Busy {
+    pub fn begin(&self, now_ms: u64) {
+        self.0.store(now_ms.max(1), Ordering::Relaxed);
+    }
+
+    pub fn end(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    pub fn stuck(&self, now_ms: u64, limit_ms: u64) -> bool {
+        let since = self.0.load(Ordering::Relaxed);
+        since != 0 && now_ms.saturating_sub(since) > limit_ms
     }
 }
 
@@ -147,6 +168,17 @@ mod tests {
         assert_eq!(preview_size(1440, 1080), (960, 720));
         assert_eq!(preview_size(1080, 1920), (404, 720));
         assert_eq!(preview_size(640, 480), (640, 480));
+    }
+
+    #[test]
+    fn busy_says_stuck_only_past_the_limit() {
+        let b = Busy::default();
+        assert!(!b.stuck(1_000_000, 1000));
+        b.begin(5000);
+        assert!(!b.stuck(5500, 1000));
+        assert!(b.stuck(6001, 1000));
+        b.end();
+        assert!(!b.stuck(6001, 1000));
     }
 
     #[test]

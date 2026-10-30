@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::av::{Output, Picture};
 use crate::rules::{PREVIEW_FPS, RateGate, preview_size, video_size};
-use crate::stream::{Flags, Shared, publish};
+use crate::stream::{Flags, Shared, clock_ms, publish};
 
 /// A picture for a child, with the source's rate when it came.
 pub struct Job {
@@ -106,7 +106,11 @@ impl Encoding {
                 state.0.take()
             };
             if let Some(job) = job {
+                let flags = self.flags.clone();
+                let busy = &flags.working[self.preview as usize];
+                busy.begin(clock_ms());
                 self.encode(&job);
+                busy.end();
             }
         }
     }

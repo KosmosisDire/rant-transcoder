@@ -4,7 +4,7 @@
 //! measures the source.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::av::{Cancel, CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
 use crate::child::{Child, Job};
-use crate::rules::{RateMeter, needs_preview};
+use crate::rules::{Busy, RateMeter, needs_preview};
 use crate::source::{Locals, Payload, Source, TopicSource, UrlSource};
 
 /// What a parent carries.
@@ -46,6 +46,15 @@ const REMEASURE_TOPIC: Duration = Duration::from_secs(60);
 const RETRY_URL: Duration = Duration::from_secs(30);
 /// How soon a viewer asking for a child that is not there brings another measure of a topic.
 const ASKED_AGAIN: Duration = Duration::from_secs(5);
+/// The worker's place among a stream's busy marks, after the children's.
+const WORKER: usize = 2;
+
+/// Milliseconds on a clock that only rises.
+pub(crate) fn clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// A source that ends sooner than this waits as long before it opens again.
 const SHORTEST_LIFE: Duration = Duration::from_secs(2);
 
@@ -94,6 +103,8 @@ pub(crate) struct Flags {
     key_preview: AtomicBool,
     /// Bumps with every new URL, which the worker reopens and the probe measures.
     generation: AtomicU32,
+    /// The Video child's encode, the Preview child's and the worker's step of work.
+    pub(crate) working: [Busy; 3],
 }
 
 impl Flags {
@@ -200,6 +211,11 @@ impl Stream {
                 s.preview = None;
             }
         }
+    }
+
+    /// A thread of this stream has been at one step for longer than the limit.
+    pub fn stuck(&self, now_ms: u64, limit_ms: u64) -> bool {
+        self.flags.working.iter().any(|b| b.stuck(now_ms, limit_ms))
     }
 
     /// A viewer asks for a child that is not there: the source may have changed, so measure it.
@@ -360,6 +376,7 @@ impl Worker {
         let rate = |meter: &RateMeter, stated: f64| if meter.count() >= 2 { meter.fps() } else { stated };
 
         while !self.flags.stop.load(Ordering::Relaxed) {
+            self.flags.working[WORKER].begin(clock_ms());
             if probing() {
                 // a URL's probe is a connection, so it ends by the clock. A topic's waits for a
                 // first picture, which costs nothing, unless what comes never tells its size
@@ -481,6 +498,7 @@ impl Worker {
                 measured_as = Some(shape);
             }
         }
+        self.flags.working[WORKER].end();
     }
 
     /// Waits, until the stream stops or its URL moves on.
