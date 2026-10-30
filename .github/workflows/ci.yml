@@ -1,11 +1,11 @@
 # Builds and tests the transcoder on every platform it ships for, and packs the archive rant
-# install unpacks. A pushed tag v<version> also cuts a GitHub Release with the archives.
+# install unpacks. A run on main whose version has no tag yet also releases it, with the
+# archives attached.
 name: ci
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -13,6 +13,28 @@ permissions:
   contents: write
 
 jobs:
+  # Whether this run releases: on main, when no tag v<version> exists yet
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: plan
+        run: |
+          v="$(sed -n 's/^version = "\(.*\)"/\1/p' transcoder/Cargo.toml | head -1)"
+          found=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$v" > /dev/null || found=$?
+          # 2 is no such tag, anything else a lookup that went wrong
+          test "$found" = 0 || test "$found" = 2
+          release=false
+          if [ "$GITHUB_REF" = refs/heads/main ] && [ "$found" = 2 ]; then release=true; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
   # Linux builds in the manylinux_2_28 containers, as Rant's wheels do, so the transcoder runs
   # on any glibc since 2.28. Runners have no GPU, so the tests run on the software encoders.
   # No win-arm64: the pinned FFmpeg's own ffmpeg.exe crashes at start on its runner.
@@ -30,11 +52,6 @@ jobs:
           - { os: windows-latest,   platform: win-x64 }
     steps:
       - uses: actions/checkout@v7
-
-      - name: The tag matches the crate's version
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' transcoder/Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,12 +98,21 @@ jobs:
             docker run --rm -v "$PWD/pkg:/p" "$image" sh -c '/p/bin/rant-transcoder --version && /p/bin/rant-transcoder --list-encoders'
           done
 
+  # The release makes the tag v<version> on this commit, once every check above passed
   release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, check-linux]
+    needs: [plan, build, check-linux]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # a later commit's run that passed too finds the version taken and stops
+      - name: The version is not released from another commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          at="$(gh api "repos/$GITHUB_REPOSITORY/commits/v${{ needs.plan.outputs.version }}" --jq .sha 2>/dev/null || true)"
+          test -z "$at" || test "$at" = "$GITHUB_SHA"
+
       - uses: actions/download-artifact@v8
         with:
           path: release
@@ -94,5 +120,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: v${{ needs.plan.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: release/*
           generate_release_notes: true
