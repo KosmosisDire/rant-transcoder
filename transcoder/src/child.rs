@@ -35,6 +35,7 @@ impl Slot {
 pub struct Child {
     slot: Arc<Slot>,
     thread: Option<JoinHandle<()>>,
+    given: Instant,
 }
 
 impl Child {
@@ -55,13 +56,19 @@ impl Child {
         };
         let slot = Arc::new(Slot::default());
         let s = slot.clone();
-        Child { slot, thread: Some(std::thread::spawn(move || e.run(&s))) }
+        Child { slot, thread: Some(std::thread::spawn(move || e.run(&s))), given: Instant::now() }
     }
 
     /// Hands over the newest picture, in place of any the child has not started.
-    pub fn give(&self, job: Job) {
+    pub fn give(&mut self, job: Job) {
+        self.given = Instant::now();
         self.slot.lock().0 = Some(job);
         self.slot.ready.notify_one();
+    }
+
+    /// How long since a picture came, so an unwatched child can give up its encoder.
+    pub fn idle(&self) -> Duration {
+        self.given.elapsed()
     }
 }
 

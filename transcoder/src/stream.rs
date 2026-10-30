@@ -55,6 +55,8 @@ pub(crate) fn clock_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// An encoder nobody has fed for this long closes, since a GeForce counts its sessions.
+const CHILD_IDLE: Duration = Duration::from_secs(5);
 /// A source that ends sooner than this waits as long before it opens again.
 const SHORTEST_LIFE: Duration = Duration::from_secs(2);
 
@@ -340,6 +342,17 @@ struct Children {
     pool: Pool,
 }
 
+impl Children {
+    /// Closes each encoder nobody watches any more, so its session is free for another.
+    fn close_idle(&mut self, video: bool, preview: bool) {
+        for (wanted, slot) in [(video, &mut self.video), (preview, &mut self.preview)] {
+            if !wanted && slot.as_ref().is_some_and(|c| c.idle() > CHILD_IDLE) {
+                *slot = None;
+            }
+        }
+    }
+}
+
 /// The thread that pulls the parent, decodes it when it must and feeds each child.
 struct Worker {
     node: Arc<Node>,
@@ -488,6 +501,8 @@ impl Worker {
                     }
                 }
             }
+
+            children.close_idle(video, preview);
 
             // a new size or codec shows at once, but a source flipping between them never makes a storm
             let since = last_measure.elapsed();
