@@ -446,8 +446,8 @@ dependencies = [
 
 [[package]]
 name = "rant-macros"
-version = "0.0.38"
-source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.38#8beb2fbad8f682b39b740727675be7e2f84284dd"
+version = "0.0.39"
+source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.39#2775a64a5f3ad07ee5861bbc2d2ba28d61117cd9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -456,8 +456,8 @@ dependencies = [
 
 [[package]]
 name = "rant-middleware"
-version = "0.0.38"
-source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.38#8beb2fbad8f682b39b740727675be7e2f84284dd"
+version = "0.0.39"
+source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.39#2775a64a5f3ad07ee5861bbc2d2ba28d61117cd9"
 dependencies = [
  "cc",
  "rant-macros",

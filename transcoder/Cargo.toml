@@ -10,7 +10,7 @@ name = "rant-transcoder"
 path = "src/main.rs"
 
 [dependencies]
-rant = { package = "rant-middleware", git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.38" }
+rant = { package = "rant-middleware", git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.39" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
