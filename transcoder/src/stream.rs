@@ -41,6 +41,12 @@ pub struct Parent {
     pub peer: u32,
 }
 
+/// How often a topic nobody watches is measured again, which only a size change needs.
+const REMEASURE_TOPIC: Duration = Duration::from_secs(60);
+/// How often a URL with no shape yet is tried, each a connection to its server.
+const RETRY_URL: Duration = Duration::from_secs(30);
+/// How soon a viewer asking for a child that is not there brings another measure of a topic.
+const ASKED_AGAIN: Duration = Duration::from_secs(5);
 /// A source that ends sooner than this waits as long before it opens again.
 const SHORTEST_LIFE: Duration = Duration::from_secs(2);
 
@@ -118,7 +124,10 @@ pub struct Stream {
     seen: (usize, usize),
     seen_generation: u32,
     last_wanted: Instant,
+    last_probe: Option<Instant>,
     next_probe: Instant,
+    /// A viewer asks for a child that is not there.
+    asked: bool,
 }
 
 impl Stream {
@@ -137,7 +146,9 @@ impl Stream {
             seen: (0, 0),
             seen_generation: 0,
             last_wanted: Instant::now(),
+            last_probe: None,
             next_probe: Instant::now(),
+            asked: false,
         };
         if s.skip {
             info!("{}: the name is too long to add /Video and /Preview, skipped", s.parent.name);
@@ -173,12 +184,22 @@ impl Stream {
         &self.parent
     }
 
+    /// A viewer asks for a child that is not there: the source may have changed, so measure it.
+    pub fn asked(&mut self) {
+        // a viewer may ask for good for a child its source never needs, and a URL's measure is a connection
+        let gap = if self.parent.origin.external() { RETRY_URL } else { ASKED_AGAIN };
+        let again = self.last_probe.map_or_else(Instant::now, |at| at + gap);
+        self.next_probe = self.next_probe.min(again);
+        self.asked = true;
+    }
+
     /// The main thread calls it about ten times a second.
     pub fn tick(&mut self) {
         if self.skip {
             return;
         }
         let now = Instant::now();
+        let external = self.parent.origin.external();
         let ((video, preview), shaped, openable) = {
             let s = lock(&self.shared);
             (s.matches(), s.shape.is_some(), !self.parent.origin.external() || !s.url.is_empty())
@@ -206,8 +227,10 @@ impl Stream {
         if self.worker.is_none() {
             if wanted && openable {
                 self.start(false);
-            } else if !shaped && openable && now >= self.next_probe {
-                self.next_probe = now + Duration::from_secs(30);
+            } else if openable && now >= self.next_probe && (!external || !shaped || self.asked) {
+                self.last_probe = Some(now);
+                self.next_probe = now + if external { RETRY_URL } else { REMEASURE_TOPIC };
+                self.asked = false;
                 self.start(true);
             }
         } else if !wanted && !self.flags.probing.load(Ordering::Relaxed) && now - self.last_wanted > Duration::from_secs(2) {
@@ -312,20 +335,26 @@ impl Worker {
         let began = Instant::now();
         let mut opened = began;
         let mut last_measure = began;
+        let mut measured_as = None;
+        let external = self.parent.origin.external();
         let rate = |meter: &RateMeter, stated: f64| if meter.count() >= 2 { meter.fps() } else { stated };
 
         while !self.flags.stop.load(Ordering::Relaxed) {
-            if probing() && began.elapsed() > Duration::from_secs(3) {
-                if width > 0 {
-                    self.measured(width, height, rate(&meter, stated_fps), h264);
-                }
-                self.flags.probing.store(false, Ordering::Relaxed);
-                if lock(&self.shared).matches() == (0, 0) {
-                    break;
+            if probing() {
+                // a URL's probe is a connection, so it ends by the clock. A topic's waits for a
+                // first picture, which costs nothing, unless what comes never tells its size
+                let done = if external { began.elapsed() > Duration::from_secs(3) } else { (width > 0 && began.elapsed() > Duration::from_secs(1)) || (meter.count() > 0 && began.elapsed() > Duration::from_secs(10)) };
+                if done {
+                    if width > 0 {
+                        self.measured(width, height, rate(&meter, stated_fps), h264);
+                    }
+                    self.flags.probing.store(false, Ordering::Relaxed);
+                    if lock(&self.shared).matches() == (0, 0) {
+                        break;
+                    }
                 }
             }
 
-            let external = self.parent.origin.external();
             let moved = external && generation != self.flags.generation.load(Ordering::Relaxed);
             let ended = src.as_ref().is_some_and(|s| s.ended());
             if ended && !moved && opened.elapsed() < SHORTEST_LIFE {
@@ -423,9 +452,13 @@ impl Worker {
                 }
             }
 
-            if !probing() && width > 0 && last_measure.elapsed() > Duration::from_secs(2) {
+            // a new size or codec shows at once, but a source flipping between them never makes a storm
+            let since = last_measure.elapsed();
+            let shape = (width, height, h264);
+            if !probing() && width > 0 && (since > Duration::from_secs(2) || (measured_as != Some(shape) && since > Duration::from_millis(500))) {
                 self.measured(width, height, rate(&meter, stated_fps), h264);
                 last_measure = Instant::now();
+                measured_as = Some(shape);
             }
         }
     }

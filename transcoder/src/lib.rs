@@ -136,6 +136,16 @@ impl Transcoder {
                 self.streams.insert(name, Stream::new(self.node.clone(), parent, self.encoder.clone(), self.workers.clone()));
             }
         }
+        // someone waits for a child that is not there, so its source may have changed
+        for e in r.mesh() {
+            if e.kind == EntityKind::Topic && e.consumers > 0 && e.providers == 0 {
+                for suffix in ["/Video", "/Preview"] {
+                    if let Some(s) = e.name.strip_suffix(suffix).and_then(|parent| self.streams.get_mut(parent)) {
+                        s.asked();
+                    }
+                }
+            }
+        }
     }
 }
 
