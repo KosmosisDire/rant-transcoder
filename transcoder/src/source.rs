@@ -1,14 +1,12 @@
 //! Where a stream's units come from: a Rant topic on this host, or a URL through FFmpeg.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rant::types::{ImageFormat, VideoCodec, VideoStreamKind};
 use rant::{Bytes, MessageView, Node, Qos, Subscriber};
 
 use crate::annexb;
-use crate::av::{CodecId, CodecParameters, Frame, Input, Layout, PixelFormat, Wrapped};
+use crate::av::{Cancel, CodecId, CodecParameters, Frame, Input, Layout, PixelFormat, Wrapped};
 
 /// One step of input: a raw picture, or one coded access unit.
 pub struct Unit<'a> {
@@ -141,11 +139,12 @@ pub struct UrlSource {
     /// The wall clock and stream time of the first unit, which later units are paced by.
     anchor: Option<(i64, i64)>,
     last_us: i64,
+    cancel: Cancel,
 }
 
 impl UrlSource {
-    /// `stop` interrupts a blocking open or read.
-    pub fn open(url: &str, kind: VideoStreamKind, stop: Arc<AtomicBool>) -> Result<UrlSource, String> {
+    /// `cancel` interrupts a blocking open or read.
+    pub fn open(url: &str, kind: VideoStreamKind, cancel: Cancel) -> Result<UrlSource, String> {
         let mut options = vec![("fflags", "nobuffer"), ("probesize", "1000000"), ("analyzeduration", "1000000")];
         match kind {
             VideoStreamKind::WebrtcWhep => return Err("WHEP is not supported yet".into()),
@@ -154,9 +153,20 @@ impl UrlSource {
             _ => {}
         }
         let format = (kind == VideoStreamKind::HttpMjpeg).then_some("mpjpeg");
-        let input = Input::open(url, format, &options, stop)?;
+        let input = Input::open(url, format, &options, cancel.clone())?;
         let p = input.parameters();
-        Ok(UrlSource { width: p.width(), height: p.height(), input, ended: false, anchor: None, last_us: 0 })
+        Ok(UrlSource { width: p.width(), height: p.height(), input, ended: false, anchor: None, last_us: 0, cancel })
+    }
+}
+
+/// Sleeps, in steps short enough that a cancel never waits on a sparse stream's long gaps.
+fn pace(how_long: Duration, cancel: &Cancel) {
+    let from = Instant::now();
+    while let Some(left) = how_long.checked_sub(from.elapsed()) {
+        if left.is_zero() || cancel() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
     }
 }
 
@@ -184,7 +194,7 @@ impl Source for UrlSource {
                 if self.anchor.is_none() || us < self.last_us || drift.abs() > 2_000_000 {
                     self.anchor = Some((now, us));
                 } else if drift > 0 {
-                    std::thread::sleep(Duration::from_micros(drift as u64));
+                    pace(Duration::from_micros(drift as u64), &self.cancel);
                 }
                 self.last_us = us;
                 let (wall, base) = self.anchor.unwrap();

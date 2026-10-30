@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::ffi::{CString, c_void};
 use std::os::raw::c_int;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{CodecId, CodecParameters, Dict, Error, Packet};
@@ -10,6 +9,9 @@ use crate::ffi;
 
 /// How long a blocking open or read may go without an answer.
 const STALL: Duration = Duration::from_secs(10);
+
+/// Asked often during a blocking call, which ends once it says true.
+pub type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// A demuxed URL's video stream, H264 and H265 turned into Annex B as Rant carries them.
 pub struct Input {
@@ -34,9 +36,9 @@ pub struct InputPacket<'a> {
     pub time_us: Option<i64>,
 }
 
-/// What FFmpeg's interrupt callback reads: the caller's stop flag and the stall deadline.
+/// What FFmpeg's interrupt callback reads: the caller's cancel and the stall deadline.
 struct Wait {
-    stop: Arc<AtomicBool>,
+    cancel: Cancel,
     deadline: Cell<Instant>,
     timed_out: Cell<bool>,
 }
@@ -55,7 +57,7 @@ impl Wait {
 unsafe extern "C" fn interrupted(opaque: *mut c_void) -> c_int {
     // SAFETY: opaque is the input's boxed Wait, alive while any call on the input runs
     let w = unsafe { &*(opaque as *const Wait) };
-    if w.stop.load(Ordering::Relaxed) {
+    if (w.cancel)() {
         return 1;
     }
     w.timed_out.set(Instant::now() > w.deadline.get());
@@ -64,9 +66,9 @@ unsafe extern "C" fn interrupted(opaque: *mut c_void) -> c_int {
 
 impl Input {
     /// Opens `url` with demuxer options, `format` naming the demuxer when probing cannot
-    /// tell. `stop` interrupts a blocking open or read.
-    pub fn open(url: &str, format: Option<&str>, options: &[(&str, &str)], stop: Arc<AtomicBool>) -> Result<Input, String> {
-        let wait = Box::new(Wait { stop, deadline: Cell::new(Instant::now() + STALL), timed_out: Cell::new(false) });
+    /// tell. `cancel` interrupts a blocking open or read.
+    pub fn open(url: &str, format: Option<&str>, options: &[(&str, &str)], cancel: Cancel) -> Result<Input, String> {
+        let wait = Box::new(Wait { cancel, deadline: Cell::new(Instant::now() + STALL), timed_out: Cell::new(false) });
         let curl = CString::new(url).map_err(|_| "the URL holds a nul byte".to_string())?;
         // SAFETY: a fresh context whose interrupt points at the boxed wait, which the Input keeps
         unsafe {

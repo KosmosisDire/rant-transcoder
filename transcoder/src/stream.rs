@@ -3,7 +3,7 @@
 //! smaller. A worker runs only while a child has a subscriber, apart from a probe that
 //! measures the source.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use rant::types::{ExternalVideoStream, Timestamp, VideoCodec, VideoFrame, VideoS
 use rant::{Node, Publisher, Qos, RemoteVariable, Subscriber, VariableOptions};
 use tracing::{info, warn};
 
-use crate::av::{CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
+use crate::av::{Cancel, CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
 use crate::child::{Child, Job};
 use crate::rules::{RateMeter, needs_preview};
 use crate::source::{Payload, Source, TopicSource, UrlSource};
@@ -65,8 +65,6 @@ pub(crate) struct Shared {
     shape: Option<Shape>,
     url: String,
     kind: VideoStreamKind,
-    /// Bumps with every new URL, which the worker reopens and the probe measures.
-    generation: u32,
 }
 
 impl Shared {
@@ -79,11 +77,13 @@ impl Shared {
 /// What the main loop tells the worker and the children.
 #[derive(Default)]
 pub(crate) struct Flags {
-    stop: Arc<AtomicBool>,
+    stop: AtomicBool,
     probing: AtomicBool,
     /// A new viewer starts on a keyframe.
     key_video: AtomicBool,
     key_preview: AtomicBool,
+    /// Bumps with every new URL, which the worker reopens and the probe measures.
+    generation: AtomicU32,
 }
 
 impl Flags {
@@ -120,7 +120,7 @@ pub struct Stream {
 
 impl Stream {
     pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, workers: Arc<()>) -> Stream {
-        let shared = Arc::new(Mutex::new(Shared { video: None, preview: None, shape: None, url: String::new(), kind: VideoStreamKind::Rtsp, generation: 0 }));
+        let shared = Arc::new(Mutex::new(Shared { video: None, preview: None, shape: None, url: String::new(), kind: VideoStreamKind::Rtsp }));
         let mut s = Stream {
             node,
             skip: parent.name.len() + "/Preview".len() > NAME_MAX,
@@ -145,17 +145,17 @@ impl Stream {
             child(&s.node, &mut lock(&s.shared).video, true, &s.parent.name, "/Video");
         }
         let name = absolute(&s.parent.name);
-        let to = s.shared.clone();
+        let (to, flags) = (s.shared.clone(), s.flags.clone());
         let made = match s.parent.origin {
             Origin::StreamVariable => s.node.remote_variable::<ExternalVideoStream>(&name, VariableOptions::new()).map(|v| {
-                if let Err(e) = v.on_change(move |d| set_descriptor(&to, &d)) {
+                if let Err(e) = v.on_change(move |d| set_descriptor(&to, &flags, &d)) {
                     warn!("{}: {e}", s.parent.name);
                 }
                 Some(Descriptor::Variable(v))
             }),
             Origin::StreamTopic => s
                 .node
-                .subscriber::<ExternalVideoStream>(&name, Qos::new().catch_up(1), move |d| set_descriptor(&to, &d))
+                .subscriber::<ExternalVideoStream>(&name, Qos::new().catch_up(1), move |d| set_descriptor(&to, &flags, &d))
                 .map(|t| Some(Descriptor::Topic(t))),
             _ => Ok(None),
         };
@@ -176,10 +176,11 @@ impl Stream {
             return;
         }
         let now = Instant::now();
-        let ((video, preview), shaped, openable, generation) = {
+        let ((video, preview), shaped, openable) = {
             let s = lock(&self.shared);
-            (s.matches(), s.shape.is_some(), !self.parent.origin.external() || !s.url.is_empty(), s.generation)
+            (s.matches(), s.shape.is_some(), !self.parent.origin.external() || !s.url.is_empty())
         };
+        let generation = self.flags.generation.load(Ordering::Relaxed);
         if generation != self.seen_generation {
             self.seen_generation = generation;
             self.next_probe = now; // a new URL is probed at once
@@ -242,7 +243,7 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn set_descriptor(shared: &Mutex<Shared>, d: &ExternalVideoStream) {
+fn set_descriptor(shared: &Mutex<Shared>, flags: &Flags, d: &ExternalVideoStream) {
     let mut s = lock(shared);
     let url = d.url.value.as_str();
     if s.url == url && s.kind == d.kind {
@@ -251,7 +252,7 @@ fn set_descriptor(shared: &Mutex<Shared>, d: &ExternalVideoStream) {
     s.url = url.to_owned();
     s.kind = d.kind;
     s.shape = None; // another stream: measure it again
-    s.generation += 1;
+    flags.generation.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Makes or drops one child's publisher to match `need`.
@@ -321,7 +322,7 @@ impl Worker {
             }
 
             let external = self.parent.origin.external();
-            if src.as_ref().is_none_or(|s| s.ended()) || (external && generation != lock(&self.shared).generation) {
+            if src.as_ref().is_none_or(|s| s.ended()) || (external && generation != self.flags.generation.load(Ordering::Relaxed)) {
                 src = None;
                 dec = None;
                 synced = false;
@@ -333,16 +334,11 @@ impl Worker {
                         told_open = false;
                     }
                     Err(why) => {
-                        if !told_open {
+                        if !told_open && !self.flags.stop.load(Ordering::Relaxed) {
                             warn!("{}: cannot open: {why}", self.parent.name);
                         }
                         told_open = true;
-                        for _ in 0..20 {
-                            if self.flags.stop.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
+                        self.pause(Duration::from_secs(2), generation);
                         if probing() {
                             break;
                         }
@@ -423,6 +419,14 @@ impl Worker {
         }
     }
 
+    /// Waits, until the stream stops or its URL moves on.
+    fn pause(&self, how_long: Duration, generation: u32) {
+        let from = Instant::now();
+        while from.elapsed() < how_long && !self.flags.stop.load(Ordering::Relaxed) && self.flags.generation.load(Ordering::Relaxed) == generation {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// The parent's source: its topic, or the URL its descriptor names now.
     fn open(&self, generation: &mut u32) -> Result<Box<dyn Source>, String> {
         if !self.parent.origin.external() {
@@ -430,15 +434,18 @@ impl Worker {
             let s = TopicSource::open(&self.node, &name, self.parent.origin == Origin::Image, self.parent.peer);
             return s.map(|s| Box::new(s) as Box<dyn Source>).map_err(|e| e.to_string());
         }
+        // the generation first, so a URL set meanwhile reopens rather than goes unseen
+        *generation = self.flags.generation.load(Ordering::Relaxed);
         let (url, kind) = {
             let s = lock(&self.shared);
-            *generation = s.generation;
             (s.url.clone(), s.kind)
         };
         if url.is_empty() {
             return Err("no URL yet".into());
         }
-        UrlSource::open(&url, kind, self.flags.stop.clone()).map(|s| Box::new(s) as Box<dyn Source>)
+        let (flags, at) = (self.flags.clone(), *generation);
+        let cancel: Cancel = Arc::new(move || flags.stop.load(Ordering::Relaxed) || flags.generation.load(Ordering::Relaxed) != at);
+        UrlSource::open(&url, kind, cancel).map(|s| Box::new(s) as Box<dyn Source>)
     }
 
     /// Hands one picture to the children that take it, each encoding it on its own thread.
