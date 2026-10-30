@@ -12,7 +12,7 @@ pub mod stream;
 #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, unsafe_op_in_unsafe_fn, clippy::all)]
 mod ffi;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -150,13 +150,17 @@ impl Transcoder {
         let r = self.node.reflection();
         let hosts = hosts::host_addresses();
         let mut found: HashMap<String, Parent> = HashMap::new();
+        let mut others: HashSet<String> = HashSet::new();
         for p in r.peers() {
-            let local = hosts::address_ip(&p.address).is_some_and(|ip| hosts.contains(&ip));
-            if !p.active || p.name == NODE || !local {
+            if !p.active || p.name == NODE {
                 continue;
             }
+            let local = hosts::address_ip(&p.address).is_some_and(|ip| hosts.contains(&ip));
             for e in r.entities(p.id) {
-                if let Some(origin) = origin_of(&e) {
+                if e.provides {
+                    others.insert(e.name.clone());
+                }
+                if local && let Some(origin) = origin_of(&e) {
                     // the first local publisher wins
                     found.entry(e.name.clone()).or_insert(Parent { name: e.name, origin, peer: p.id });
                 }
@@ -172,8 +176,12 @@ impl Transcoder {
         for (name, parent) in found {
             if !self.streams.contains_key(&name) {
                 info!("{name}: found on this host");
-                self.streams.insert(name, Stream::new(self.node.clone(), parent, self.encoder.clone(), self.workers.clone()));
+                let taken = taken_children(&name, &others);
+                self.streams.insert(name, Stream::new(self.node.clone(), parent, self.encoder.clone(), self.workers.clone(), taken));
             }
+        }
+        for (name, s) in &mut self.streams {
+            s.set_taken(taken_children(name, &others));
         }
         // someone waits for a child that is not there, so its source may have changed
         for e in r.mesh() {
@@ -186,6 +194,11 @@ impl Transcoder {
             }
         }
     }
+}
+
+/// Which of a parent's children another node on the mesh publishes.
+fn taken_children(parent: &str, others: &HashSet<String>) -> [bool; 2] {
+    ["/Video", "/Preview"].map(|suffix| others.contains(&format!("{parent}{suffix}")))
 }
 
 /// The file whose lock says who serves a domain on this host, in a folder every user shares, so

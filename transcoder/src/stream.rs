@@ -71,6 +71,8 @@ struct Shape {
 pub(crate) struct Shared {
     video: Option<Publisher<VideoFrame>>,
     preview: Option<Publisher<VideoFrame>>,
+    /// Which of Video and Preview another node publishes, left to it.
+    taken: [bool; 2],
     shape: Option<Shape>,
     url: String,
     kind: VideoStreamKind,
@@ -131,8 +133,9 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, workers: Arc<()>) -> Stream {
-        let shared = Arc::new(Mutex::new(Shared { video: None, preview: None, shape: None, url: String::new(), kind: VideoStreamKind::Rtsp }));
+    /// `taken` says which of its children another node publishes already.
+    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, workers: Arc<()>, taken: [bool; 2]) -> Stream {
+        let shared = Arc::new(Mutex::new(Shared { video: None, preview: None, taken, shape: None, url: String::new(), kind: VideoStreamKind::Rtsp }));
         let mut s = Stream {
             node,
             skip: parent.name.len() + "/Preview".len() > NAME_MAX,
@@ -155,7 +158,7 @@ impl Stream {
             return s;
         }
         // pictures and URLs always change on the way to Video, a VideoFrame topic waits for its codec
-        if s.parent.origin != Origin::VideoFrame {
+        if s.parent.origin != Origin::VideoFrame && !taken[0] {
             child(&s.node, &mut lock(&s.shared).video, true, &s.parent.name, "/Video");
         }
         let name = absolute(&s.parent.name);
@@ -182,6 +185,20 @@ impl Stream {
 
     pub fn parent(&self) -> &Parent {
         &self.parent
+    }
+
+    /// Says which of its children another node publishes, whose names it leaves to them.
+    pub fn set_taken(&mut self, taken: [bool; 2]) {
+        let mut s = lock(&self.shared);
+        if s.taken != taken {
+            s.taken = taken;
+            if taken[0] {
+                s.video = None;
+            }
+            if taken[1] {
+                s.preview = None;
+            }
+        }
     }
 
     /// A viewer asks for a child that is not there: the source may have changed, so measure it.
@@ -514,8 +531,8 @@ impl Worker {
         let changed = s.shape.is_none_or(|o| o.width != width || o.height != height || o.h264 != h264 || (fps - o.fps).abs() > o.fps * 0.2);
         s.shape = Some(Shape { width, height, fps, h264 });
         // a copy of what is on the mesh already changes nothing, so it is never published
-        let video = self.parent.origin != Origin::VideoFrame || !h264;
-        let preview = needs_preview(width, height);
+        let video = (self.parent.origin != Origin::VideoFrame || !h264) && !s.taken[0];
+        let preview = needs_preview(width, height) && !s.taken[1];
         let name = &self.parent.name;
         child(&self.node, &mut s.video, video, name, "/Video");
         child(&self.node, &mut s.preview, preview, name, "/Preview");
