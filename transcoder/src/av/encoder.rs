@@ -88,11 +88,16 @@ pub struct Encoder {
     colors: Colors,
     packet: Packet,
     last_pts: i64,
+    /// Added to source times, so the times it gets rise whatever the source's clock does.
+    shift: i64,
     params: ParameterSets,
 }
 
 // SAFETY: the context belongs to this encoder alone
 unsafe impl Send for Encoder {}
+
+/// What an encoder's picture times step by when the source's clock goes back.
+const PTS_STEP: i64 = 33_333;
 
 /// Held while an encoder opens or closes. Media Foundation unloads the GPU driver on close,
 /// which crashes or hangs another thread opening one at the same time.
@@ -102,7 +107,9 @@ impl Encoder {
     /// Opens one encoder at a size, for pictures in system memory or, given a device's pool,
     /// for that pool's pictures. None when it does not open.
     pub(super) fn open(spec: &Spec, width: u32, height: u32, fps: f64, colors: Colors, frames: Option<&Frames>) -> Option<Encoder> {
-        let fps = if fps > 0.0 { fps } else { 30.0 };
+        // a source's clock can claim any rate, and encoders refuse the extremes. NVENC under WSL
+        // crashes at exactly 1 fps on a busy picture, 9 runs of 10, and never at 2
+        let fps = if fps > 0.0 { fps.clamp(2.0, 240.0) } else { 30.0 };
         if spec.name == "h264_qsv" && cfg!(target_os = "linux") && !hw::have_vaapi() {
             return None;
         }
@@ -134,7 +141,7 @@ impl Encoder {
             colors.stamp_encoder(c);
             let mut options = Dict::of(spec.tune);
             if ffi::avcodec_open2(ctx, codec, &mut options.0) == 0 {
-                return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, params: ParameterSets::default() });
+                return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, shift: 0, params: ParameterSets::default() });
             }
             ffi::avcodec_free_context(&mut ctx);
         }
@@ -172,7 +179,12 @@ impl Encoder {
     /// Encodes a picture at the encoder's size and format. `keyframe` forces an IDR. `out`
     /// gets each access unit in Annex B and whether it is a keyframe. False when it fails.
     pub(super) fn encode(&mut self, picture: &mut Frame, time_us: u64, keyframe: bool, mut out: impl FnMut(&[u8], bool)) -> bool {
-        let pts = (time_us as i64).max(self.last_pts.saturating_add(1));
+        let mut pts = (time_us as i64).saturating_add(self.shift);
+        if pts <= self.last_pts {
+            let rising = self.last_pts.saturating_add(PTS_STEP);
+            self.shift = self.shift.saturating_add(rising - pts);
+            pts = rising;
+        }
         self.last_pts = pts;
         // SAFETY: the picture is ours to stamp, and each packet is ours between receive and unref
         unsafe {

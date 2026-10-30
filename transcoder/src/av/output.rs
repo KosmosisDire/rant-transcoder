@@ -196,6 +196,23 @@ mod tests {
         }
     }
 
+    /// A picture of noise, which JPEG's quantizer shows on.
+    fn noise(w: usize, h: usize) -> Picture {
+        let pixels: Vec<u8> = (0..w * h * 3 / 2).map(|i| (i as u32).wrapping_mul(2654435761).to_le_bytes()[3]).collect();
+        let mut raw = Frame::new();
+        let wrapped = raw.wrap(&pixels, Layout { width: w as u32, height: h as u32, stride: 0, format: PixelFormat::NV12 }).unwrap();
+        Picture::new(Pool::default().own(&wrapped).unwrap())
+    }
+
+    #[test]
+    fn an_encoder_takes_any_rate_a_source_claims() {
+        let picture = noise(320, 240);
+        for fps in [0.0, 0.0003, 0.5, 100_000.0] {
+            let mut o = Output::open(&picture, 320, 240, fps, None, &[]).unwrap_or_else(|| panic!("opens at {fps} fps"));
+            assert!(o.encode(&picture, 0, true, |_, _| {}), "{} encodes at {fps} fps", o.describe());
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn media_foundation_opens_on_threads_at_once() {

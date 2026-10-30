@@ -58,6 +58,8 @@ impl RateGate {
     pub fn pass(&mut self, time_us: u64) -> bool {
         let t = time_us as f64;
         let next = match self.next {
+            // the source's clock went back, so what passed last says nothing
+            Some(next) if next - t > 1e6 => t + self.period,
             // an eighth of a period of slack, so a source at exactly the rate never loses a frame to jitter
             Some(next) if t + self.period / 8.0 < next => return false,
             Some(next) if t < next + self.period => next + self.period,
@@ -68,6 +70,9 @@ impl RateGate {
     }
 }
 
+/// A gap in source time past this is a jump of its clock, not a slow source.
+const CLOCK_JUMP_US: u64 = 30_000_000;
+
 /// Pictures a second over the last two seconds of source time.
 #[derive(Default)]
 pub struct RateMeter {
@@ -76,8 +81,8 @@ pub struct RateMeter {
 
 impl RateMeter {
     pub fn add(&mut self, time_us: u64) {
-        if self.times.back().is_some_and(|&last| time_us < last) {
-            self.times.clear(); // the clock went back: start over
+        if self.times.back().is_some_and(|&last| time_us < last || time_us - last > CLOCK_JUMP_US) {
+            self.times.clear(); // the clock jumped: start over
         }
         self.times.push_back(time_us);
         while self.times.len() > 2 && self.times.back().unwrap() - self.times.front().unwrap() > 2_000_000 {
@@ -145,6 +150,17 @@ mod tests {
     }
 
     #[test]
+    fn gate_starts_over_when_time_goes_back() {
+        let mut g = RateGate::new(PREVIEW_FPS);
+        let hour = 3_600_000_000u64;
+        assert!(g.pass(hour));
+        assert!(!g.pass(hour + 1_000));
+        assert!(g.pass(1_000)); // back an hour
+        assert!(!g.pass(2_000));
+        assert!(g.pass(1_000 + 50_000));
+    }
+
+    #[test]
     fn gate_keeps_24_a_second() {
         // ten seconds at each rate: a slower source keeps every picture
         assert!((238..=242).contains(&gated(30.0, 300)));
@@ -161,6 +177,11 @@ mod tests {
         }
         assert!((29.5..30.5).contains(&m.fps()));
         m.add(0);
+        assert_eq!((m.count(), m.fps()), (1, 0.0));
+        // a jump ahead starts over too, a slow source does not
+        m.add(10_000_000);
+        assert_eq!(m.count(), 2);
+        m.add(3_700_000_000);
         assert_eq!((m.count(), m.fps()), (1, 0.0));
     }
 }
