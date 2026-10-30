@@ -66,6 +66,11 @@ impl Child {
         self.slot.ready.notify_one();
     }
 
+    /// Its thread ended, which only a panic does, so it must be started again.
+    pub fn died(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
     /// How long since a picture came, so an unwatched child can give up its encoder.
     pub fn idle(&self) -> Duration {
         self.given.elapsed()

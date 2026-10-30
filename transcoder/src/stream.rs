@@ -550,6 +550,10 @@ impl Worker {
         // the children read it after the source has moved on, so it needs a frame of its own
         let Some(picture) = children.pool.own(picture).map(|f| Arc::new(Picture::new(f))) else { return };
         for (wanted, slot, is_preview) in [(to_video, &mut children.video, false), (preview, &mut children.preview, true)] {
+            if slot.as_ref().is_some_and(Child::died) {
+                warn!("{}: an encoder thread died, starting another", self.parent.name);
+                *slot = None;
+            }
             if wanted {
                 let c = slot.get_or_insert_with(|| Child::start(&self.parent.name, is_preview, self.encoder.clone(), self.shared.clone(), self.flags.clone()));
                 c.give(Job { picture: picture.clone(), time_us, fps });
