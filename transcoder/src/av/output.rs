@@ -95,7 +95,7 @@ impl Output {
         for spec in specs() {
             match spec.device {
                 Some((kind, _)) if spec.device_only => {
-                    let Some(pool) = hw::device(kind).and_then(|d| Frames::new(d, width, height)) else { continue };
+                    let Some(pool) = hw::device(kind).and_then(|d| Frames::new(&d, width, height)) else { continue };
                     if let Some(e) = Encoder::open(spec, width, height, fps, colors, Some(&pool)) {
                         return output(e, Path::Upload(Scaler::default(), pool, kind.kind));
                     }

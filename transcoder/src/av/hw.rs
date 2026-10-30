@@ -1,23 +1,37 @@
-//! The hardware devices pictures are decoded and converted on, one per kind for the whole
-//! process.
+//! The hardware devices pictures are decoded and converted on, one per kind, shared by all.
 
 use std::os::raw::c_int;
 use std::ptr::NonNull;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::{Dict, Frame, static_text};
 use crate::ffi;
 
-/// A device context FFmpeg made, kept until the process ends.
-#[derive(Clone, Copy)]
+/// A reference to a device context FFmpeg made, which goes with the last reference.
 pub(super) struct Device(NonNull<ffi::AVBufferRef>);
 
 // SAFETY: FFmpeg's device contexts take references from any thread
 unsafe impl Send for Device {}
 
 impl Device {
-    pub(super) fn as_ptr(self) -> *mut ffi::AVBufferRef {
+    pub(super) fn as_ptr(&self) -> *mut ffi::AVBufferRef {
         self.0.as_ptr()
+    }
+}
+
+impl Clone for Device {
+    fn clone(&self) -> Device {
+        // SAFETY: a new reference to a valid one, null only when memory runs out
+        Device(NonNull::new(unsafe { ffi::av_buffer_ref(self.as_ptr()) }).expect("FFmpeg could not reference a device"))
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        let mut p = self.0.as_ptr();
+        // SAFETY: our reference alone
+        unsafe { ffi::av_buffer_unref(&mut p) };
     }
 }
 
@@ -51,15 +65,26 @@ pub(super) const DECODE: &[Kind] = &[Kind::VIDEOTOOLBOX];
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(super) const DECODE: &[Kind] = &[Kind::CUDA, Kind::VAAPI];
 
-/// The device of a kind, made on first ask. None when this machine has none.
+/// How long a device that would not open is left alone, since a driver may still be loading.
+const RETRY_DEVICE: Duration = Duration::from_secs(60);
+
+/// The devices of each kind made so far, and when a failed one failed.
+static MADE: Mutex<Vec<(Kind, Result<Device, Instant>)>> = Mutex::new(Vec::new());
+
+/// The device of a kind, made on first ask. None when this machine has none now.
 pub(super) fn device(kind: Kind) -> Option<Device> {
-    static MADE: Mutex<Vec<(Kind, Option<Device>)>> = Mutex::new(Vec::new());
     if kind.kind == ffi::AV_HWDEVICE_TYPE_VAAPI && !have_vaapi() {
         return None;
     }
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, d)) = made.iter().find(|(k, _)| *k == kind) {
-        return *d;
+    if let Some(i) = made.iter().position(|(k, _)| *k == kind) {
+        match &made[i].1 {
+            Ok(d) => return Some(d.clone()),
+            Err(at) if at.elapsed() < RETRY_DEVICE => return None,
+            Err(_) => {
+                drop(made.swap_remove(i));
+            }
+        }
     }
     let vendor = format!("{:#x}", kind.vendor);
     let options = if kind.vendor == 0 { Dict::of(&[]) } else { Dict::of(&[("vendor_id", &vendor)]) };
@@ -67,8 +92,14 @@ pub(super) fn device(kind: Kind) -> Option<Device> {
     // SAFETY: on failure FFmpeg leaves p null, and it only reads the options
     let ok = unsafe { ffi::av_hwdevice_ctx_create(&mut p, kind.kind, std::ptr::null(), options.0, 0) } >= 0;
     let d = if ok { NonNull::new(p).map(Device) } else { None };
-    made.push((kind, d));
+    made.push((kind, d.clone().ok_or_else(Instant::now)));
     d
+}
+
+/// Forgets a device of a type that keeps failing, as after a GPU reset, so the next ask makes
+/// another. Those still using it keep it until they let go.
+pub(super) fn forget(kind: ffi::AVHWDeviceType) {
+    MADE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, d)| k.kind != kind || d.is_err());
 }
 
 /// A pool of pictures on a device, which an encoder reads.
@@ -80,7 +111,7 @@ unsafe impl Send for Frames {}
 impl Frames {
     /// A pool of NV12 pictures of a size on a device, for pictures uploaded from system memory.
     /// None when the device makes none.
-    pub(super) fn new(device: Device, width: u32, height: u32) -> Option<Frames> {
+    pub(super) fn new(device: &Device, width: u32, height: u32) -> Option<Frames> {
         // SAFETY: the pool is set up before its init and freed when the init fails, and the
         // constraints are freed once read
         unsafe {

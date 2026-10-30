@@ -35,7 +35,7 @@ impl Decoder {
                     continue;
                 }
                 if let Some(device) = hw::device(kind)
-                    && d.open_with(native, Some((device, format)))
+                    && d.open_with(native, Some((&device, format)))
                 {
                     return Some(d);
                 }
@@ -71,7 +71,7 @@ impl Decoder {
         !codec.is_null() && self.open_with(codec, None)
     }
 
-    fn open_with(&mut self, codec: *const ffi::AVCodec, device: Option<(Device, ffi::AVPixelFormat)>) -> bool {
+    fn open_with(&mut self, codec: *const ffi::AVCodec, device: Option<(&Device, ffi::AVPixelFormat)>) -> bool {
         // SAFETY: a fresh context set up before its open, freed on any failure
         unsafe {
             ffi::avcodec_free_context(&mut self.ctx);
@@ -150,6 +150,10 @@ impl Decoder {
             self.errors += 1;
             if self.errors >= 30 {
                 tracing::info!("decoder {} keeps failing, switching to software", self.describe());
+                // SAFETY: an open context's device reference is null or valid
+                if let Some(device) = hw::type_of(unsafe { (*self.ctx).hw_device_ctx }) {
+                    hw::forget(device);
+                }
                 if !self.open_software() {
                     // SAFETY: ours alone
                     unsafe { ffi::avcodec_free_context(&mut self.ctx) };
