@@ -104,6 +104,8 @@ pub struct Stream {
     node: Arc<Node>,
     parent: Parent,
     encoder: Option<String>,
+    /// Counts live workers, so the transcoder can wait for them at its end.
+    workers: Arc<()>,
     /// The name leaves no room for a child's.
     skip: bool,
     shared: Arc<Mutex<Shared>>,
@@ -117,13 +119,14 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>) -> Stream {
+    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, workers: Arc<()>) -> Stream {
         let shared = Arc::new(Mutex::new(Shared { video: None, preview: None, shape: None, url: String::new(), kind: VideoStreamKind::Rtsp, generation: 0 }));
         let mut s = Stream {
             node,
             skip: parent.name.len() + "/Preview".len() > NAME_MAX,
             parent,
             encoder,
+            workers,
             shared,
             flags: Arc::default(),
             _descriptor: None,
@@ -219,6 +222,7 @@ impl Stream {
             shared: self.shared.clone(),
             flags: self.flags.clone(),
             out: VideoFrame { codec: VideoCodec::H264, ..VideoFrame::default() },
+            _counted: self.workers.clone(),
         };
         self.worker = Some(std::thread::spawn(move || w.run()));
     }
@@ -227,9 +231,10 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         self.flags.stop.store(true, Ordering::Relaxed);
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
+        // the names go free now for a stream that takes over, and the worker ends in its own
+        // time, since one stuck in FFmpeg or a driver must not hold up the main thread
+        let mut s = lock(&self.shared);
+        (s.video, s.preview) = (None, None);
     }
 }
 
@@ -282,6 +287,7 @@ struct Worker {
     flags: Arc<Flags>,
     /// The reused outgoing message.
     out: VideoFrame,
+    _counted: Arc<()>,
 }
 
 impl Worker {

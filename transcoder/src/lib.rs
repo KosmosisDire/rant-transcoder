@@ -38,6 +38,8 @@ pub struct Transcoder {
     node: Arc<Node>,
     encoder: Option<String>,
     streams: HashMap<String, Stream>,
+    /// Counts live workers, each holding a clone.
+    workers: Arc<()>,
     epoch: u32,
 }
 
@@ -72,7 +74,7 @@ impl Transcoder {
             warn!("rant: {text}");
             told.insert(text, now);
         });
-        Ok(Transcoder { node: Arc::new(node), encoder: options.encoder, streams: HashMap::new(), epoch: 0 })
+        Ok(Transcoder { node: Arc::new(node), encoder: options.encoder, streams: HashMap::new(), workers: Arc::new(()), epoch: 0 })
     }
 
     /// Runs until `stop` says so, then closes every stream.
@@ -90,9 +92,19 @@ impl Transcoder {
             for s in self.streams.values_mut() {
                 s.tick();
             }
+            // everything here is quick, so a slow pass means a stream holds up the others
+            let took = now.elapsed();
+            if took > Duration::from_secs(1) {
+                warn!("the main loop took {took:?}");
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
         self.streams.clear();
+        // workers end in their own time, and one stuck in a driver must not stop the process
+        let from = Instant::now();
+        while Arc::strong_count(&self.workers) > 1 && from.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn scan(&mut self) {
@@ -121,7 +133,7 @@ impl Transcoder {
         for (name, parent) in found {
             if !self.streams.contains_key(&name) {
                 info!("{name}: found on this host");
-                self.streams.insert(name, Stream::new(self.node.clone(), parent, self.encoder.clone()));
+                self.streams.insert(name, Stream::new(self.node.clone(), parent, self.encoder.clone(), self.workers.clone()));
             }
         }
     }
