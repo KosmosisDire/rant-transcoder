@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::av::{Cancel, CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
 use crate::child::{Child, Job};
-use crate::rules::{Busy, RateMeter, needs_preview};
+use crate::rules::{Busy, RateMeter, SIDE_MAX, needs_preview};
 use crate::source::{Locals, Payload, Source, TopicSource, UrlSource};
 
 /// What a parent carries.
@@ -380,6 +380,7 @@ impl Worker {
         let mut synced = false; // the decoder started on a keyframe and missed nothing since
         let (mut told_open, mut told_decode) = (false, false);
         let (mut width, mut height) = (0, 0); // the latest picture size, decoded or stated
+        let mut decoded_size = false; // a decoder said the size, which outranks what is stated
         let mut h264 = false; // the source arrives as H264
         let began = Instant::now();
         let mut opened = began;
@@ -415,6 +416,7 @@ impl Worker {
                 src = None;
                 dec = None;
                 synced = false;
+                decoded_size = false;
                 match self.open(&mut generation) {
                     Ok(s) => {
                         params = s.parameters();
@@ -443,7 +445,8 @@ impl Worker {
                 Payload::Picture(p) => (p.width(), p.height()),
                 Payload::Coded { .. } => (u.width, u.height),
             };
-            if w > 0 && h > 0 {
+            let stated = w > 0 && h > 0 && w <= SIDE_MAX && h <= SIDE_MAX;
+            if stated && !decoded_size {
                 (width, height) = (w, h);
             }
             let fps = Some(rate(&meter, stated_fps)).filter(|&r| r > 0.0).unwrap_or(30.0);
@@ -455,6 +458,7 @@ impl Worker {
             match u.payload {
                 Payload::Picture(p) => {
                     h264 = false;
+                    decoded_size = false;
                     if video || preview {
                         self.feed(&mut children, &p, video, preview, fps, u.time_us);
                     }
@@ -471,6 +475,7 @@ impl Worker {
                         if dec.as_ref().is_some_and(|d| d.codec() != codec) {
                             dec = None;
                             synced = false;
+                            decoded_size = false;
                         }
                         if !dec.as_ref().is_some_and(Decoder::is_open) {
                             dec = Decoder::open(codec, params.as_ref().filter(|p| p.codec() == codec), self.encoder.as_deref());
@@ -494,10 +499,12 @@ impl Worker {
                         let d = dec.as_mut().unwrap();
                         synced = d.decode(data, |f| {
                             (width, height) = (f.width(), f.height());
+                            decoded_size = true;
                             self.feed(&mut children, f, video && !pass, preview, fps, u.time_us);
                         });
                     } else {
                         synced = false; // frames go by undecoded, so the next decode starts on a keyframe
+                        decoded_size = false;
                     }
                 }
             }

@@ -5,6 +5,8 @@ use super::hw::{self, Device};
 use super::{CodecId, CodecParameters, Error, Frame, Packet, Dict, static_text};
 use crate::ffi;
 
+const MAX_PIXELS: i64 = 1 << 28;
+
 /// Decodes one codec, on a hardware device when one takes it, whose pictures stay there.
 pub struct Decoder {
     ctx: *mut ffi::AVCodecContext,
@@ -83,6 +85,8 @@ impl Decoder {
             // frame threads hold pictures back a frame each, slice threads add no delay
             c.thread_type = ffi::FF_THREAD_SLICE as c_int;
             c.flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as c_int;
+            // a bad header must not claim gigabytes, and no real picture comes near this
+            c.max_pixels = MAX_PIXELS;
             self.hw = ffi::AV_PIX_FMT_NONE;
             if let Some((device, format)) = device {
                 c.hw_device_ctx = ffi::av_buffer_ref(device.as_ptr());

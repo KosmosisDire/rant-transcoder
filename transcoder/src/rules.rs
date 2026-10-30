@@ -16,6 +16,9 @@ pub const H264_MAX_BLOCKS: u32 = 36864;
 /// The smallest side every encoder takes: one block. openh264, the last tried, needs it.
 pub const H264_MIN_SIDE: u32 = 16;
 
+/// A source's size past this is no real size: JPEG and H264 stop here.
+pub const SIDE_MAX: u32 = 65535;
+
 /// Video keeps its source's size with both sides even, grown to one block a side or shrunk to
 /// fit H264's largest picture.
 pub fn video_size(width: u32, height: u32) -> (u32, u32) {
