@@ -66,9 +66,8 @@ const OPENH264: Spec = Spec {
     device_only: false,
 };
 
-/// The H264 encoders tried, best first: each vendor's own, then the system's, then openh264.
-/// One that is full or missing falls through to the next. Vulkan's is left out: NVIDIA's
-/// makes High profile only, not the constrained baseline every browser decodes.
+/// The H264 encoders tried, best first. One that is full or missing falls through to the next.
+/// Vulkan's is left out: NVIDIA's makes High only, not the constrained baseline browsers decode.
 #[cfg(windows)]
 pub(super) const ORDER: &[Spec] = &[NVENC, QSV, AMF, MF, OPENH264];
 #[cfg(target_os = "macos")]
@@ -90,7 +89,10 @@ pub struct Encoder {
     last_pts: i64,
     /// Added to source times, so the times it gets rise whatever the source's clock does.
     shift: i64,
-    params: ParameterSets,
+    /// H264's, which a JPEG has no need of.
+    params: Option<ParameterSets>,
+    /// The quantizer a JPEG picture is told, in FFmpeg's lambda.
+    quality: c_int,
 }
 
 // SAFETY: the context belongs to this encoder alone
@@ -141,11 +143,46 @@ impl Encoder {
             colors.stamp_encoder(c);
             let mut options = Dict::of(spec.tune);
             if ffi::avcodec_open2(ctx, codec, &mut options.0) == 0 {
-                return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, shift: 0, params: ParameterSets::default() });
+                return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, shift: 0, params: Some(ParameterSets::default()), quality: 0 });
             }
             ffi::avcodec_free_context(&mut ctx);
         }
         None
+    }
+
+    /// Opens FFmpeg's own JPEG encoder at a fixed quantizer, 2 best to 31 worst. It stays on one
+    /// thread, since its slices need restart markers that the simplest JPEG readers lack.
+    pub(super) fn open_jpeg(width: u32, height: u32, quantizer: u8) -> Option<Encoder> {
+        let colors = Colors::JFIF;
+        // SAFETY: a lookup in FFmpeg's static tables, then a fresh context set up before its
+        // open and freed when the open fails
+        unsafe {
+            let codec = ffi::avcodec_find_encoder(ffi::AV_CODEC_ID_MJPEG);
+            if codec.is_null() {
+                return None;
+            }
+            let mut ctx = ffi::avcodec_alloc_context3(codec);
+            let c = &mut *ctx;
+            c.width = width as c_int;
+            c.height = height as c_int;
+            c.time_base = ffi::AVRational { num: 1, den: 1_000_000 };
+            c.pix_fmt = ffi::AV_PIX_FMT_YUV420P;
+            c.thread_count = 1;
+            c.flags |= ffi::AV_CODEC_FLAG_QSCALE as c_int;
+            c.qmin = quantizer as c_int;
+            c.qmax = quantizer as c_int;
+            colors.stamp_encoder(c);
+            if ffi::avcodec_open2(ctx, codec, std::ptr::null_mut()) == 0 {
+                let quality = quantizer as c_int * ffi::FF_QP2LAMBDA as c_int;
+                return Some(Encoder { ctx, colors, packet: Packet::new(), last_pts: i64::MIN, shift: 0, params: None, quality });
+            }
+            ffi::avcodec_free_context(&mut ctx);
+        }
+        None
+    }
+
+    pub(super) fn is_jpeg(&self) -> bool {
+        self.params.is_none()
     }
 
     fn raw(&self) -> &ffi::AVCodecContext {
@@ -191,6 +228,7 @@ impl Encoder {
             let p = &mut *picture.as_mut_ptr();
             p.pts = pts;
             p.pict_type = if keyframe { ffi::AV_PICTURE_TYPE_I } else { ffi::AV_PICTURE_TYPE_NONE };
+            p.quality = self.quality;
             if ffi::avcodec_send_frame(self.ctx, p) < 0 {
                 return false;
             }
@@ -200,7 +238,10 @@ impl Encoder {
                     return Error(r) == Error::AGAIN || Error(r) == Error::EOF;
                 }
                 let key = self.packet.raw().flags & ffi::AV_PKT_FLAG_KEY as c_int != 0;
-                out(&self.params.complete(self.packet.data(), key), key);
+                match &mut self.params {
+                    Some(params) => out(&params.complete(self.packet.data(), key), key),
+                    None => out(self.packet.data(), key),
+                }
                 self.packet.unref();
             }
         }
@@ -209,7 +250,8 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        let _one = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+        // FFmpeg's JPEG encoder touches no device, so it never waits on one that does
+        let _one = (!self.is_jpeg()).then(|| OPENING.lock().unwrap_or_else(|e| e.into_inner()));
         // SAFETY: ours alone
         unsafe { ffi::avcodec_free_context(&mut self.ctx) };
     }

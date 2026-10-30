@@ -110,9 +110,19 @@ impl Output {
         None
     }
 
+    /// Opens a JPEG encoder for a size at a fixed quantizer, 2 best to 31 worst. It always works
+    /// in system memory, where any picture comes down to.
+    pub fn open_jpeg(picture: &Picture, width: u32, height: u32, quantizer: u8) -> Option<Output> {
+        let encoder = Encoder::open_jpeg(width, height, quantizer)?;
+        Some(Output { encoder, path: Path::System(Scaler::default()), colors: Colors::JFIF, on_device: picture.frame().on_device() })
+    }
+
     /// It takes pictures like this one at this size, else it must be opened again.
     pub fn fits(&self, picture: &Picture, width: u32, height: u32) -> bool {
         let f = picture.frame();
+        if self.encoder.is_jpeg() {
+            return self.encoder.width() == width && self.encoder.height() == height;
+        }
         let path = match &self.path {
             Path::Device(filter, _) => filter.takes(f),
             Path::System(_) | Path::Upload(..) => f.on_device() == self.on_device,
@@ -202,6 +212,43 @@ mod tests {
         let mut raw = Frame::new();
         let wrapped = raw.wrap(&pixels, Layout { width: w as u32, height: h as u32, stride: 0, format: PixelFormat::NV12 }).unwrap();
         Picture::new(Pool::default().own(&wrapped).unwrap())
+    }
+
+    fn jpegs(picture: &Picture, w: u32, h: u32, quantizer: u8) -> Vec<(Vec<u8>, bool)> {
+        let mut o = Output::open_jpeg(picture, w, h, quantizer).unwrap();
+        let mut units = Vec::new();
+        for i in 0..3 {
+            assert!(o.encode(picture, 5_000_000 - i * 1_000_000, false, |data, key| units.push((data.to_vec(), key))), "times going back encode");
+        }
+        units
+    }
+
+    #[test]
+    fn jpeg_is_plain_and_every_picture_stands_alone() {
+        let (w, h) = (64, 48);
+        let picture = noise(w, h);
+        let units = jpegs(&picture, w as u32, h as u32, 5);
+        assert_eq!(units.len(), 3);
+        for (data, key) in &units {
+            assert!(key, "a JPEG is a keyframe");
+            // a reader with the least JPEG support manages: one baseline frame, no restart markers
+            assert!(data.starts_with(&[0xff, 0xd8]) && data.ends_with(&[0xff, 0xd9]));
+            assert!(data.windows(2).any(|b| b == [0xff, 0xc0]), "a baseline frame");
+            assert!(!data.windows(2).any(|b| b == [0xff, 0xc2]), "a progressive frame");
+            assert!(!data.windows(2).any(|b| b == [0xff, 0xdd]), "a restart interval");
+            let mut d = Decoder::software(CodecId::MJPEG, None).unwrap();
+            let mut size = None;
+            d.decode(data, |f| size = Some((f.width(), f.height())));
+            assert_eq!(size, Some((w as u32, h as u32)));
+        }
+    }
+
+    #[test]
+    fn a_higher_quantizer_makes_a_smaller_jpeg() {
+        let picture = noise(320, 240);
+        let size = |q| jpegs(&picture, 320, 240, q)[0].0.len();
+        let (fine, coarse) = (size(5), size(10));
+        assert!(coarse < fine * 9 / 10, "quantizer 5 makes {fine} bytes, 10 makes {coarse}");
     }
 
     #[test]

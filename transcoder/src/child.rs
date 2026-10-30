@@ -5,11 +5,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rant::types::{VideoCodec, VideoFrame};
+use rant::types::VideoFrame;
 use tracing::{info, warn};
 
 use crate::av::{Output, Picture};
-use crate::rules::{PREVIEW_FPS, RateGate, preview_size, video_size};
+use crate::rules::{Kind, PREVIEW_FPS, RateGate};
 use crate::stream::{Flags, Shared, clock_ms, publish};
 
 /// A picture for a child, with the source's rate when it came.
@@ -39,11 +39,11 @@ pub struct Child {
 }
 
 impl Child {
-    /// `name` is the parent's. The preview child keeps its own size and rate.
-    pub fn start(name: &str, preview: bool, only: Option<String>, shared: Arc<Mutex<Shared>>, flags: Arc<Flags>) -> Child {
+    /// `name` is the parent's. The kind says the child's size, rate and codec.
+    pub fn start(name: &str, kind: Kind, only: Option<String>, shared: Arc<Mutex<Shared>>, flags: Arc<Flags>) -> Child {
         let e = Encoding {
-            name: format!("{name}{}", if preview { "/Preview" } else { "/Video" }),
-            preview,
+            name: format!("{name}{}", kind.suffix()),
+            kind,
             only,
             shared,
             flags,
@@ -51,8 +51,8 @@ impl Child {
             errors: 0,
             refused: Vec::new(),
             failed: None,
-            gate: preview.then(|| RateGate::new(PREVIEW_FPS)),
-            out: VideoFrame { codec: VideoCodec::H264, ..VideoFrame::default() },
+            gate: kind.is_preview().then(|| RateGate::new(PREVIEW_FPS)),
+            out: VideoFrame::default(),
         };
         let slot = Arc::new(Slot::default());
         let s = slot.clone();
@@ -66,14 +66,14 @@ impl Child {
         self.slot.ready.notify_one();
     }
 
-    /// Its thread ended, which only a panic does, so it must be started again.
-    pub fn died(&self) -> bool {
-        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
-    }
-
     /// How long since a picture came, so an unwatched child can give up its encoder.
     pub fn idle(&self) -> Duration {
         self.given.elapsed()
+    }
+
+    /// Its thread ended, which only a panic does, so it must be started again.
+    pub fn died(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
     }
 }
 
@@ -90,7 +90,7 @@ impl Drop for Child {
 /// The child's thread: its encoder and what feeds it.
 struct Encoding {
     name: String,
-    preview: bool,
+    kind: Kind,
     only: Option<String>,
     shared: Arc<Mutex<Shared>>,
     flags: Arc<Flags>,
@@ -119,7 +119,7 @@ impl Encoding {
             };
             if let Some(job) = job {
                 let flags = self.flags.clone();
-                let busy = &flags.working[self.preview as usize];
+                let busy = &flags.working[self.kind as usize];
                 busy.begin(clock_ms());
                 self.encode(&job);
                 busy.end();
@@ -132,20 +132,15 @@ impl Encoding {
             return;
         }
         let p = &*job.picture;
-        let (width, height) = (p.frame().width(), p.frame().height());
-        let (w, h, fps) = if self.preview {
-            let (w, h) = preview_size(width, height);
-            (w, h, job.fps.min(PREVIEW_FPS))
-        } else {
-            let (w, h) = video_size(width, height);
-            (w, h, job.fps)
-        };
+        let kind = self.kind;
+        let (w, h) = kind.size(p.frame().width(), p.frame().height());
+        let fps = if kind.is_preview() { job.fps.min(PREVIEW_FPS) } else { job.fps };
         if !self.ready(p, w, h, fps) {
             return;
         }
         let Some(o) = &mut self.output else { return };
-        let (shared, out, preview, t) = (&self.shared, &mut self.out, self.preview, job.time_us);
-        if o.encode(p, t, self.flags.take_key(preview), |data, key| publish(shared, out, preview, data, key, w, h, t)) {
+        let (shared, out, t) = (&self.shared, &mut self.out, job.time_us);
+        if o.encode(p, t, self.flags.take_key(kind), |data, key| publish(shared, out, kind, data, key, w, h, t)) {
             self.errors = 0;
             return;
         }
@@ -172,7 +167,11 @@ impl Encoding {
         self.refused.retain(|(_, at)| now - *at < Duration::from_secs(60));
         let refused: Vec<&str> = self.refused.iter().map(|(name, _)| *name).collect();
         self.output = None; // a GeForce counts the open sessions
-        self.output = Output::open(picture, width, height, fps, self.only.as_deref(), &refused);
+        self.output = if self.kind.is_mjpeg() {
+            Output::open_jpeg(picture, width, height, self.kind.jpeg_quantizer())
+        } else {
+            Output::open(picture, width, height, fps, self.only.as_deref(), &refused)
+        };
         match &self.output {
             Some(o) => {
                 info!("{}: {width}x{height} at {fps:.1} fps with {}", self.name, o.describe());
@@ -180,7 +179,7 @@ impl Encoding {
             }
             None => {
                 if self.failed.is_none_or(|(s, _)| s != size) {
-                    warn!("{}: no H264 encoder opens at {width}x{height}", self.name);
+                    warn!("{}: no encoder opens at {width}x{height}", self.name);
                 }
                 self.failed = Some((size, now));
             }

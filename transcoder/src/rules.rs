@@ -1,4 +1,4 @@
-//! Each child's size, when a preview exists, and the rates both children are judged by.
+//! Which children a source gets, each one's size, and the rates they are judged by.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +8,10 @@ pub const PREVIEW_WIDTH: u32 = 1280;
 pub const PREVIEW_HEIGHT: u32 = 720;
 pub const PREVIEW_FPS: f64 = 24.0;
 
+/// The MJPEG preview, which fits this on its longest side at the same rate. JPEG costs far more
+/// bytes a pixel than H264, so a low stream of it has to be smaller.
+pub const MJPEG_PREVIEW_SIDE: u32 = 640;
+
 /// H264's largest picture at level 5.2, the most players are held to decode: 4096 a side and
 /// 36864 blocks of 16x16, which 4096x2304 fills.
 pub const H264_MAX_SIDE: u32 = 4096;
@@ -16,8 +20,81 @@ pub const H264_MAX_BLOCKS: u32 = 36864;
 /// The smallest side every encoder takes: one block. openh264, the last tried, needs it.
 pub const H264_MIN_SIDE: u32 = 16;
 
+/// Rant's name limit, which a child's name must also fit.
+const NAME_MAX: usize = 64;
+
 /// A source's size past this is no real size: JPEG and H264 stop here.
 pub const SIDE_MAX: u32 = 65535;
+
+/// A stream's children: H264 and MJPEG, each at the source's size and as a smaller preview.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Video,
+    Preview,
+    Mjpeg,
+    MjpegPreview,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::Video, Kind::Preview, Kind::Mjpeg, Kind::MjpegPreview];
+
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Kind::Video => "/Video",
+            Kind::Preview => "/Preview",
+            Kind::Mjpeg => "/Mjpeg",
+            Kind::MjpegPreview => "/MjpegPreview",
+        }
+    }
+
+    pub fn is_preview(self) -> bool {
+        matches!(self, Kind::Preview | Kind::MjpegPreview)
+    }
+
+    pub fn is_mjpeg(self) -> bool {
+        matches!(self, Kind::Mjpeg | Kind::MjpegPreview)
+    }
+
+    /// The child's picture for a source of this size.
+    pub fn size(self, width: u32, height: u32) -> (u32, u32) {
+        match self {
+            Kind::Video | Kind::Mjpeg => video_size(width, height),
+            Kind::Preview => preview_size(width, height),
+            Kind::MjpegPreview => fit(width, height, MJPEG_PREVIEW_SIDE, MJPEG_PREVIEW_SIDE),
+        }
+    }
+
+    /// FFmpeg's JPEG scale for an MJPEG child, 2 best to 31 worst. The preview's is where going
+    /// coarser starts to show blocks and save little.
+    pub fn jpeg_quantizer(self) -> u8 {
+        if self.is_preview() { 15 } else { 5 }
+    }
+}
+
+/// How a source arrives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Coding {
+    Raw,
+    H264,
+    Mjpeg,
+    Other,
+}
+
+/// Whether a child changes its source. A copy of what is on the mesh already never does, nor
+/// does a preview the size of its source. `on_mesh` is false for a URL, which a copy brings there.
+pub fn needs_child(kind: Kind, coding: Coding, on_mesh: bool, width: u32, height: u32) -> bool {
+    match kind {
+        Kind::Video => !(on_mesh && coding == Coding::H264),
+        Kind::Mjpeg => !(on_mesh && coding == Coding::Mjpeg),
+        Kind::Preview => needs_preview(width, height),
+        Kind::MjpegPreview => width > MJPEG_PREVIEW_SIDE || height > MJPEG_PREVIEW_SIDE,
+    }
+}
+
+/// The child's full name fits Rant's limit.
+pub fn name_fits(parent: &str, kind: Kind) -> bool {
+    parent.len() + kind.suffix().len() <= NAME_MAX
+}
 
 /// Video keeps its source's size with both sides even, grown to one block a side or shrunk to
 /// fit H264's largest picture.
@@ -43,7 +120,12 @@ pub fn needs_preview(width: u32, height: u32) -> bool {
 
 /// The source scaled to fit 1280x720, never up, both sides even.
 pub fn preview_size(width: u32, height: u32) -> (u32, u32) {
-    let s = 1f64.min(PREVIEW_WIDTH as f64 / width as f64).min(PREVIEW_HEIGHT as f64 / height as f64);
+    fit(width, height, PREVIEW_WIDTH, PREVIEW_HEIGHT)
+}
+
+/// A picture scaled to fit a box, never up, both sides even.
+fn fit(width: u32, height: u32, box_width: u32, box_height: u32) -> (u32, u32) {
+    let s = 1f64.min(box_width as f64 / width as f64).min(box_height as f64 / height as f64);
     let side = |v: u32| ((v as f64 * s).round() as u32 & !1).max(2);
     (side(width), side(height))
 }
@@ -171,6 +253,47 @@ mod tests {
         assert_eq!(preview_size(1440, 1080), (960, 720));
         assert_eq!(preview_size(1080, 1920), (404, 720));
         assert_eq!(preview_size(640, 480), (640, 480));
+    }
+
+    #[test]
+    fn children_only_where_they_change_the_source() {
+        let needs = |kind, coding, on_mesh, w, h| needs_child(kind, coding, on_mesh, w, h);
+        // a topic that is H264 already gets no H264 copy, one that is MJPEG no MJPEG copy
+        assert!(!needs(Kind::Video, Coding::H264, true, 640, 480));
+        assert!(needs(Kind::Mjpeg, Coding::H264, true, 640, 480));
+        assert!(needs(Kind::Video, Coding::Mjpeg, true, 640, 480));
+        assert!(!needs(Kind::Mjpeg, Coding::Mjpeg, true, 640, 480));
+        // raw pictures and other codecs get both
+        for coding in [Coding::Raw, Coding::Other] {
+            assert!(needs(Kind::Video, coding, true, 640, 480) && needs(Kind::Mjpeg, coding, true, 640, 480));
+        }
+        // a URL's copy brings it onto the mesh
+        assert!(needs(Kind::Video, Coding::H264, false, 640, 480));
+        assert!(needs(Kind::Mjpeg, Coding::Mjpeg, false, 640, 480));
+        // the H264 preview only above 720p, the MJPEG one only above 640 a side
+        assert!(!needs(Kind::Preview, Coding::Raw, true, 1280, 720));
+        assert!(needs(Kind::Preview, Coding::H264, true, 1920, 1080));
+        assert!(needs(Kind::MjpegPreview, Coding::Raw, true, 1280, 720));
+        assert!(needs(Kind::MjpegPreview, Coding::Mjpeg, true, 641, 360));
+        assert!(needs(Kind::MjpegPreview, Coding::H264, true, 360, 641));
+        assert!(!needs(Kind::MjpegPreview, Coding::Raw, true, 640, 480));
+        assert!(!needs(Kind::MjpegPreview, Coding::Raw, true, 360, 640));
+    }
+
+    #[test]
+    fn the_mjpeg_preview_is_smaller_and_coarser() {
+        for ((w, h), want) in [((1920, 1080), (640, 360)), ((1280, 720), (640, 360)), ((4000, 3000), (640, 480)), ((1080, 1920), (360, 640))] {
+            assert_eq!(Kind::MjpegPreview.size(w, h), want, "{w}x{h}");
+        }
+        assert_eq!(Kind::Mjpeg.size(1920, 1080), (1920, 1080));
+        assert!(Kind::MjpegPreview.jpeg_quantizer() > Kind::Mjpeg.jpeg_quantizer());
+    }
+
+    #[test]
+    fn a_long_name_loses_only_the_children_that_do_not_fit() {
+        let name = "n".repeat(58);
+        assert!(name_fits(&name, Kind::Video) && name_fits(&name, Kind::Mjpeg));
+        assert!(!name_fits(&name, Kind::Preview) && !name_fits(&name, Kind::MjpegPreview));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 name        = "transcoder"
-description = "Republishes this host's video as H264 any viewer can play, only where that changes it"
+description = "Republishes this host's video as H264 and MJPEG any viewer can play, only where that changes it"
 
 node "transcoder" {
   run = "${path.package}/bin/rant-transcoder"

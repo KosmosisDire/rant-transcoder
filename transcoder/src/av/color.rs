@@ -1,10 +1,11 @@
 use super::Frame;
 use crate::ffi;
 
-/// What a child's pictures stand for and its stream says they do: always limited range, which
-/// H264 players assume, with a matrix, primaries and transfer taken from its source.
+/// What a child's pictures stand for. H264 is limited range, which its players assume, with the
+/// rest from its source. JPEG is what the JFIF file format fixes for every reader.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Colors {
+    range: ffi::AVColorRange,
     matrix: ffi::AVColorSpace,
     primaries: ffi::AVColorPrimaries,
     transfer: ffi::AVColorTransferCharacteristic,
@@ -16,21 +17,24 @@ impl Colors {
     pub fn for_child(src: &Frame) -> Colors {
         let f = src.raw();
         if is_yuv(f.format) {
-            Colors { matrix: f.colorspace, primaries: f.color_primaries, transfer: f.color_trc }
+            Colors { range: ffi::AVCOL_RANGE_MPEG, matrix: f.colorspace, primaries: f.color_primaries, transfer: f.color_trc }
         } else {
-            Colors { matrix: ffi::AVCOL_SPC_BT709, primaries: ffi::AVCOL_PRI_BT709, transfer: ffi::AVCOL_TRC_BT709 }
+            Colors { range: ffi::AVCOL_RANGE_MPEG, matrix: ffi::AVCOL_SPC_BT709, primaries: ffi::AVCOL_PRI_BT709, transfer: ffi::AVCOL_TRC_BT709 }
         }
     }
 
+    /// Full range with the BT.601 matrix.
+    pub(super) const JFIF: Colors = Colors { range: ffi::AVCOL_RANGE_JPEG, matrix: ffi::AVCOL_SPC_BT470BG, primaries: ffi::AVCOL_PRI_UNSPECIFIED, transfer: ffi::AVCOL_TRC_UNSPECIFIED };
+
     pub(super) fn stamp(self, f: &mut ffi::AVFrame) {
-        f.color_range = ffi::AVCOL_RANGE_MPEG;
+        f.color_range = self.range;
         f.colorspace = self.matrix;
         f.color_primaries = self.primaries;
         f.color_trc = self.transfer;
     }
 
     pub(super) fn stamp_encoder(self, c: &mut ffi::AVCodecContext) {
-        c.color_range = ffi::AVCOL_RANGE_MPEG;
+        c.color_range = self.range;
         c.colorspace = self.matrix;
         c.color_primaries = self.primaries;
         c.color_trc = self.transfer;
@@ -153,6 +157,11 @@ mod tests {
                     assert_ne!(range, ffi::AVCOL_RANGE_JPEG, "{path}: the stream says full range");
                     assert!(near(got, (16, 235)), "{path}: H264 carries {got:?}");
                 }
+                let path = format!("{source} through {} into MJPEG", d.describe());
+                let jpegs = encode(&mut Output::open_jpeg(&picture, W as u32, H as u32, 5).unwrap(), &picture);
+                let seen = first(&mut Decoder::software(CodecId::MJPEG, None).unwrap(), &jpegs).unwrap_or_else(|| panic!("{path}: the JPEG decodes"));
+                let got = levels(seen.system().unwrap());
+                assert!(near(got, (0, 255)), "{path}: JPEG carries {got:?}");
             }
         }
     }
@@ -166,6 +175,8 @@ mod tests {
             let mut s = Scaler::default();
             let out = s.convert(&picture, W as u32, H as u32, PixelFormat::NV12, Colors::for_child(&picture)).unwrap();
             assert!(near(levels(out), (16, 235)), "{format:?} scales to {:?}", levels(out));
+            let out = s.convert(&picture, W as u32, H as u32, PixelFormat::YUV420P, Colors::JFIF).unwrap();
+            assert!(near(levels(out), (0, 255)), "{format:?} scales for JPEG to {:?}", levels(out));
         }
     }
 }

@@ -1,6 +1,6 @@
 # rant-transcoder
 
-Republishes the video on this host's Rant nodes as H264 any viewer can play.
+Republishes the video on this host's Rant nodes as H264 and MJPEG any viewer can play.
 
 ```
 rant install transcoder

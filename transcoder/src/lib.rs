@@ -1,5 +1,5 @@
-//! The Rant transcoder: one node per host that republishes this host's video as H264 any
-//! viewer can play, only where that changes it.
+//! The Rant transcoder: one node per host that republishes this host's video as H264 and MJPEG
+//! any viewer can play, only where that changes it.
 
 pub mod annexb;
 pub mod av;
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use rant::{Entity, EntityKind, Node, NodeOptions};
 use tracing::{error, info, warn};
 
+use rules::{Kind, name_fits};
 use source::Locals;
 use stream::{Origin, Parent, Stream};
 
@@ -58,8 +59,8 @@ impl Transcoder {
             .domain(options.domain)
             // schemas tell an Image from any other topic
             .fetch_details(true)
-            // up to five per stream: two children, the parent, a descriptor
-            .max_topics(512)
+            // up to six per stream: four children, the parent or its descriptor's two channels
+            .max_topics(1024)
             .max_peers(256)
             // it logs to stdout, and the log topics of a peer on an older Rant never match
             .disable_logs(true);
@@ -213,8 +214,8 @@ impl Transcoder {
         // someone waits for a child that is not there, so its source may have changed
         for e in r.mesh() {
             if e.kind == EntityKind::Topic && e.consumers > 0 && e.providers == 0 {
-                for suffix in ["/Video", "/Preview"] {
-                    if let Some(s) = e.name.strip_suffix(suffix).and_then(|parent| self.streams.get_mut(parent)) {
+                for k in Kind::ALL {
+                    if let Some(s) = e.name.strip_suffix(k.suffix()).and_then(|parent| self.streams.get_mut(parent)) {
                         s.asked();
                     }
                 }
@@ -224,8 +225,8 @@ impl Transcoder {
 }
 
 /// Which of a parent's children another node on the mesh publishes.
-fn taken_children(parent: &str, others: &HashSet<String>) -> [bool; 2] {
-    ["/Video", "/Preview"].map(|suffix| others.contains(&format!("{parent}{suffix}")))
+fn taken_children(parent: &str, others: &HashSet<String>) -> [bool; 4] {
+    Kind::ALL.map(|k| name_fits(parent, k) && others.contains(&format!("{parent}{}", k.suffix())))
 }
 
 /// The file whose lock says who serves a domain on this host, in a folder every user shares, so

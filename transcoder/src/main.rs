@@ -6,9 +6,10 @@ use rant_transcoder::{Options, Transcoder, av};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-/// Republishes the video on this host's Rant nodes as H264 any viewer can play, only where
-/// that changes it: Parent/Video at the source's size and rate unless the source is H264 on
-/// the mesh already, Parent/Preview at 720p and 24 fps when the source is bigger than 720p.
+/// Republishes the video on this host's Rant nodes as H264 and MJPEG any viewer can play, only
+/// where that changes it: Parent/Video and Parent/Mjpeg at the source's size and rate unless the
+/// source is that codec on the mesh already, Parent/Preview at 720p and Parent/MjpegPreview at 640
+/// a side, lower quality too, each at 24 fps and only when the source is bigger.
 #[derive(Parser)]
 #[command(name = "rant-transcoder", version)]
 struct Args {

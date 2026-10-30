@@ -93,8 +93,8 @@ impl Decoder {
                 // the format itself rides in opaque, so the callback needs no pointer back to us
                 c.opaque = format as isize as *mut c_void;
                 c.get_format = Some(pick_format);
-                // a device pool can be fixed, and each child holds a picture or two from it
-                c.extra_hw_frames = 8;
+                // a device pool can be fixed, and each of four children holds a picture or two from it
+                c.extra_hw_frames = 12;
                 self.hw = format;
             }
             // dav1d's own low latency switch

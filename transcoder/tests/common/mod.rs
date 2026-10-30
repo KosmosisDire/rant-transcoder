@@ -34,7 +34,7 @@ const fn expect(name: &'static str, width: u32, height: u32, min: f64, max: f64)
     Expect { name, size: (width, height), fps: (min, max) }
 }
 
-/// The children each of the camera's sources must and must not get.
+/// The H264 children each of the camera's sources must and must not get.
 pub const CHILDREN: [Expect; 12] = [
     expect("Test/Raw/Video", 1920, 1080, 20.0, 32.0), // raw: Video and a smaller Preview
     expect("Test/Raw/Preview", 1280, 720, 18.0, 26.0),
@@ -50,11 +50,27 @@ pub const CHILDREN: [Expect; 12] = [
     expect("Test/Cam/Preview", 0, 0, 0.0, 0.0),
 ];
 
+/// The MJPEG children of the same sources.
+pub const MJPEG_CHILDREN: [Expect; 12] = [
+    expect("Test/Raw/Mjpeg", 1920, 1080, 20.0, 32.0), // raw: MJPEG and a smaller preview
+    expect("Test/Raw/MjpegPreview", 640, 360, 18.0, 26.0),
+    expect("Test/Small/Mjpeg", 640, 480, 14.0, 22.0), // 480p: a preview would be the same size
+    expect("Test/Small/MjpegPreview", 0, 0, 0.0, 0.0),
+    expect("Test/Big264/Mjpeg", 1920, 1080, 20.0, 32.0), // H264: both, since neither is on the mesh
+    expect("Test/Big264/MjpegPreview", 640, 360, 18.0, 26.0),
+    expect("Test/Small264/Mjpeg", 1280, 720, 20.0, 32.0), // 720p: still above the preview's 640
+    expect("Test/Small264/MjpegPreview", 640, 360, 18.0, 26.0),
+    expect("Test/Jpeg/Mjpeg", 0, 0, 0.0, 0.0), // MJPEG at 480p: nothing changes, nothing published
+    expect("Test/Jpeg/MjpegPreview", 0, 0, 0.0, 0.0),
+    expect("Test/Cam/Mjpeg", 1280, 720, 24.0, 36.0), // a URL: decoded and made MJPEG
+    expect("Test/Cam/MjpegPreview", 640, 360, 18.0, 26.0),
+];
+
 /// Coded frames to publish in a loop, each with its keyframe flag.
 type Clip = Vec<(Vec<u8>, bool)>;
 
 /// Runs the pinned FFmpeg's ffmpeg tool, which makes the clips.
-fn ffmpeg(args: &[&str]) {
+pub fn ffmpeg(args: &[&str]) {
     let exe = Path::new(env!("TRANSCODER_FFMPEG_DIR")).join("bin").join("ffmpeg");
     let status = Command::new(&exe).args(["-v", "error", "-y"]).args(args).status().expect("ffmpeg runs");
     assert!(status.success(), "ffmpeg {args:?} failed");
@@ -236,25 +252,44 @@ impl Drop for SoloCamera {
 /// What the viewer saw on one child.
 #[derive(Default)]
 pub struct Watch {
-    decoder: Option<Decoder>,
+    decoder: Option<(VideoCodec, Decoder)>,
     synced: bool,
     pub size: (u32, u32),
     pub received: u32,
+    /// Frames the decoder refused.
+    pub errors: u32,
+    pub codec: Option<VideoCodec>,
     decoded: Vec<Instant>,
 }
 
 impl Watch {
     fn add(&mut self, f: &VideoFrame) {
         self.received += 1;
-        if f.codec != VideoCodec::H264 || (!self.synced && !f.keyframe) {
+        self.codec = Some(f.codec);
+        let id = match f.codec {
+            VideoCodec::H264 => CodecId::H264,
+            VideoCodec::Mjpeg => CodecId::MJPEG,
+            _ => return,
+        };
+        if self.decoder.as_ref().is_none_or(|(c, _)| *c != f.codec) {
+            self.decoder = Some((f.codec, Decoder::open(id, None, None).expect("a decoder")));
+            self.synced = false;
+        }
+        if !self.synced && !f.keyframe {
             return;
         }
-        let d = self.decoder.get_or_insert_with(|| Decoder::open(CodecId::H264, None, None).expect("an H264 decoder"));
+        let Some((_, d)) = &mut self.decoder else { return };
         let (size, decoded) = (&mut self.size, &mut self.decoded);
         self.synced = d.decode(&f.data, |p| {
             *size = (p.width(), p.height());
             decoded.push(Instant::now());
         });
+        self.errors += !self.synced as u32;
+    }
+
+    /// Pictures decoded since a moment.
+    pub fn since(&self, from: Instant) -> usize {
+        self.decoded.iter().filter(|&&t| t >= from).count()
     }
 
     /// Decoded pictures a second over the last window.
@@ -296,6 +331,30 @@ impl Viewer {
         Viewer { node, watches, stop, readers }
     }
 
+    /// One more child to watch, until the reader drops.
+    pub fn read(&self, name: &str) -> Reader {
+        self.read_with(name, Qos::new().queue_bytes(16 << 20))
+    }
+
+    /// The same with options of its own, such as a rate.
+    pub fn read_with(&self, name: &str, qos: Qos) -> Reader {
+        let (watch, stop) = (Arc::new(Mutex::new(Watch::default())), Arc::new(AtomicBool::new(false)));
+        let (w, stopped) = (watch.clone(), stop.clone());
+        let mut sub = self.node.pulled_subscriber::<VideoFrame>(name, qos).unwrap();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                if let Ok(Some(f)) = sub.take(Duration::from_millis(100)) {
+                    w.lock().unwrap().add(&f);
+                }
+            }
+        });
+        Reader { name: name.into(), watch, stop, thread: Some(thread) }
+    }
+
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// The topic as the viewer's mesh shows it now.
     pub fn find(&self, name: &str) -> Option<Entity> {
         self.node.reflection().find(EntityKind::Topic, name)
@@ -307,6 +366,41 @@ impl Drop for Viewer {
         self.stop.store(true, Ordering::Relaxed);
         for r in self.readers.drain(..) {
             let _ = r.join();
+        }
+    }
+}
+
+/// A viewer of one child that comes and goes.
+pub struct Reader {
+    pub name: String,
+    pub watch: Arc<Mutex<Watch>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Reader {
+    /// How long until `pictures` more pictures decoded, None when they did not within `limit`.
+    pub fn plays(&self, pictures: usize, limit: Duration) -> Option<Duration> {
+        let from = Instant::now();
+        while from.elapsed() < limit {
+            if self.watch.lock().unwrap().since(from) >= pictures {
+                return Some(from.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        self.watch.lock().unwrap().size
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
     }
 }

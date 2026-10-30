@@ -8,16 +8,20 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use common::{CHILDREN, Camera, DOMAIN, LOOPBACK, SoloCamera, Viewer};
+use common::{CHILDREN, Camera, DOMAIN, Expect, LOOPBACK, MJPEG_CHILDREN, SoloCamera, Viewer};
 use rant_transcoder::{Options, Transcoder, av};
 
 /// The tests share one domain, so they take turns.
 static TURN: Mutex<()> = Mutex::new(());
 
+/// Taken before anything opens, since the tests' sources share their names.
+fn turn() -> MutexGuard<'static, ()> {
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Starts the transcoder, opened under a prefix of its own, which the names it reads from the
 /// mesh skip. It runs until the flag is set.
-fn transcoder() -> (MutexGuard<'static, ()>, Arc<AtomicBool>, JoinHandle<()>) {
-    let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+fn transcoder() -> (Arc<AtomicBool>, JoinHandle<()>) {
     // the transcoder's own lines, shown when the test fails
     let _ = tracing_subscriber::fmt().with_env_filter("info").with_test_writer().try_init();
     av::set_log_level(false);
@@ -27,18 +31,19 @@ fn transcoder() -> (MutexGuard<'static, ()>, Arc<AtomicBool>, JoinHandle<()>) {
     unsafe { std::env::remove_var("RANT_PREFIX") };
     let done = Arc::new(AtomicBool::new(false));
     let stop = done.clone();
-    (turn, done, std::thread::spawn(move || t.run(|| stop.load(Ordering::Relaxed))))
+    (done, std::thread::spawn(move || t.run(|| stop.load(Ordering::Relaxed))))
 }
 
-#[test]
-fn children_carry_what_changes() {
+/// Watches children for a while, and checks each carries what it must or does not exist.
+fn children_carry(children: &[Expect]) {
+    let _turn = turn();
     let camera = Camera::start();
-    let (_turn, done, transcoder) = transcoder();
+    let (done, transcoder) = transcoder();
 
-    let viewer = Viewer::watch(&CHILDREN.map(|c| c.name));
+    let viewer = Viewer::watch(&children.iter().map(|c| c.name).collect::<Vec<_>>());
     std::thread::sleep(Duration::from_secs(16));
     let mut failed = 0;
-    for (e, w) in CHILDREN.iter().zip(&viewer.watches) {
+    for (e, w) in children.iter().zip(&viewer.watches) {
         let w = w.lock().unwrap();
         let fps = w.fps(Duration::from_secs(5));
         let ok = if e.size.0 > 0 {
@@ -57,9 +62,20 @@ fn children_carry_what_changes() {
 }
 
 #[test]
+fn h264_children_carry_what_changes() {
+    children_carry(&CHILDREN);
+}
+
+#[test]
+fn mjpeg_children_carry_what_changes() {
+    children_carry(&MJPEG_CHILDREN);
+}
+
+#[test]
 fn a_restarted_camera_comes_back() {
+    let _turn = turn();
     let mut camera = Some(SoloCamera::start());
-    let (_turn, done, transcoder) = transcoder();
+    let (done, transcoder) = transcoder();
     let viewer = Viewer::watch(&["Test/Solo/Video"]);
     std::thread::sleep(Duration::from_secs(6));
     // gone for longer than a scan, then back as a new node
