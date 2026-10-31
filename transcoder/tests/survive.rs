@@ -33,10 +33,15 @@ struct Service {
 
 impl Service {
     fn start() -> Service {
+        Service::with_args(&[])
+    }
+
+    fn with_args(args: &[&str]) -> Service {
         let log = std::env::temp_dir().join(format!("rant-transcoder-survive-{}-{}.log", std::process::id(), wall_us()));
         let file = std::fs::File::create(&log).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_rant-transcoder"))
             .args(["--domain", &DOMAIN.to_string(), "--interface", LOOPBACK])
+            .args(args)
             .env("NO_COLOR", "1")
             .stdout(file.try_clone().unwrap())
             .stderr(file)
@@ -571,6 +576,49 @@ fn garbage_stops_nothing() {
     });
     plays(&preview, "garbage frames");
     plays(&video, "garbage images");
+    service.alive();
+}
+
+#[test]
+fn an_encoder_a_bad_picture_kills_opens_again() {
+    let _turn = turn();
+    // OpenH264 frees itself when a picture overflows it, and it is the only encoder on a host
+    // with no GPU. Only pure noise on a generous budget does it, so slow and small
+    let mut service = Service::with_args(&["--encoder", "libopenh264"]);
+    let node = Node::new("cam", local()).unwrap();
+    let p: Publisher<Image> = node.publisher("Test/Killer", Qos::new()).unwrap();
+    let nv12 = |width, height, data| Image { width, height, stride: 0, format: ImageFormat::Nv12, data };
+    let flat = |width: u32, height: u32| nv12(width, height, vec![90; (width * height * 3 / 2) as usize]);
+    let (w, h) = (322, 240);
+    let mut state = 1u64;
+    let mut random = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 56) as u8
+    };
+    let noise = nv12(w, h, (0..w * h * 3 / 2).map(|_| random()).collect());
+    let viewer = Viewer::watch(&[]);
+    let video = viewer.read("Test/Killer/Video");
+
+    // long enough at 2 fps that the encoder for the next size opens with that rate's budget
+    let first = flat(320, 240);
+    for _ in 0..12 {
+        let _ = p.send_captured(&first, now());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    for _ in 0..8 {
+        let _ = p.send_captured(&noise, now());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(service.log().contains("opening it again"), "the noise left the encoder alive
+{}", service.log());
+
+    let good = flat(w, h);
+    let _feed = Ticker::every(FRAME, move |_| {
+        let _ = p.send_captured(&good, now());
+    });
+    let took = video.plays(5, Duration::from_secs(90)).expect("plays again");
+    println!("played {took:?} after the bad pictures");
+    assert!(took < SOON, "a bad picture kept the video away for {took:?}");
     service.alive();
 }
 

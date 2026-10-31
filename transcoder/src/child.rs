@@ -144,13 +144,17 @@ impl Encoding {
             self.errors = 0;
             return;
         }
-        // an encoder that opens yet fails every picture gives way to the next
+        // a failure can kill an encoder for good, as a picture that overflows OpenH264 does, so
+        // it opens again at once. One that keeps failing gives way to the next
+        if self.errors == 0 {
+            info!("{}: {} failed a picture, opening it again", self.name, o.describe());
+        }
         self.errors += 1;
-        if self.errors >= 30 {
+        if self.errors.is_multiple_of(30) {
             warn!("{}: {} keeps failing, trying the next encoder", self.name, o.describe());
             self.refused.push((o.encoder(), Instant::now()));
-            (self.output, self.errors) = (None, 0);
         }
+        self.output = None;
     }
 
     /// Opens the output for pictures like this one at a size when it is not open for them already.
@@ -170,7 +174,9 @@ impl Encoding {
         self.output = if self.kind.is_mjpeg() {
             Output::open_jpeg(picture, width, height, self.kind.jpeg_quantizer())
         } else {
-            Output::open(picture, width, height, fps, self.only.as_deref(), &refused)
+            let only = self.only.as_deref();
+            // on a host with one encoder, a refused one still beats none
+            Output::open(picture, width, height, fps, only, &refused).or_else(|| if refused.is_empty() { None } else { Output::open(picture, width, height, fps, only, &[]) })
         };
         match &self.output {
             Some(o) => {
