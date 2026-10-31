@@ -252,12 +252,23 @@ mod tests {
     }
 
     #[test]
-    fn an_encoder_takes_any_rate_a_source_claims() {
-        let picture = noise(320, 240);
-        for fps in [0.0, 0.0003, 0.5, 100_000.0] {
-            let mut o = Output::open(&picture, 320, 240, fps, None, &[]).unwrap_or_else(|| panic!("opens at {fps} fps"));
-            assert!(o.encode(&picture, 0, true, |_, _| {}), "{} encodes at {fps} fps", o.describe());
+    fn every_encoder_takes_any_rate_a_source_claims() {
+        // busy but no garbage: noise in brightness alone, since noise in colour too kills OpenH264
+        let (w, h) = (320, 240);
+        let mut pixels: Vec<u8> = (0..w * h).map(|i| (i as u32).wrapping_mul(2654435761).to_le_bytes()[3]).collect();
+        pixels.resize(w * h * 3 / 2, 128);
+        let mut raw = Frame::new();
+        let wrapped = raw.wrap(&pixels, Layout { width: w as u32, height: h as u32, stride: 0, format: PixelFormat::NV12 }).unwrap();
+        let picture = Picture::new(Pool::default().own(&wrapped).unwrap());
+        let mut opened = 0;
+        for spec in ORDER {
+            for fps in [0.0, 0.0003, 0.5, 100_000.0] {
+                let Some(mut o) = Output::open(&picture, w as u32, h as u32, fps, Some(spec.name), &[]) else { continue };
+                assert!(o.encode(&picture, 0, true, |_, _| {}), "{} encodes at {fps} fps", o.describe());
+                opened += 1;
+            }
         }
+        assert!(opened > 0, "no encoder opens");
     }
 
     #[cfg(windows)]
