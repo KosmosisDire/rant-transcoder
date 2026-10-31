@@ -40,6 +40,13 @@ decoder is software there, unless `--gpus all` and `NVIDIA_DRIVER_CAPABILITIES=a
 container an NVIDIA GPU, which NVENC and CUDA then use. VAAPI cannot be reached from a
 container on Windows.
 
+A machine with a GPU never reaches OpenH264, the only encoder on a CI runner. To run as CI does,
+hide the GPU and take four cores:
+
+```sh
+CUDA_VISIBLE_DEVICES=-1 taskset -c 0-3 cargo test --release
+```
+
 ## Costs
 
 `examples/bench.rs` publishes the test's sources and watches each child, then prints the
