@@ -48,6 +48,12 @@ pub trait Source: Send {
     fn stated_fps(&self) -> f64 {
         0.0
     }
+
+    /// The size of raw pictures that a source which only described its stream states, which
+    /// measures it without playing. None for a source that plays.
+    fn described_size(&self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// UTC microseconds now.
@@ -142,12 +148,13 @@ fn video<'a>(m: &MessageView<'a>, data: &'a [u8]) -> Option<Payload<'a>> {
 }
 
 /// A URL's units: raw pictures in GStreamer's X-GST payload through this transcoder's own RTSP
-/// client, anything else through FFmpeg.
-pub fn open_url(url: &str, kind: VideoStreamKind, cancel: Cancel) -> Result<Box<dyn Source>, String> {
+/// client, anything else through FFmpeg. Without `play`, X-GST is only described, which
+/// measures it from its SDP and leaves the camera free.
+pub fn open_url(url: &str, kind: VideoStreamKind, cancel: Cancel, play: bool) -> Result<Box<dyn Source>, String> {
     if kind == VideoStreamKind::Rtsp
         && let Some(d) = rtsp::describe(url, &cancel)?
     {
-        let session = rtsp::Session::open(url, &d, &cancel)?;
+        let session = if play { Some(rtsp::Session::open(url, &d, &cancel)?) } else { None };
         return Ok(Box::new(RawRtspSource { session, layout: d.layout, fps: d.fps, picture: Frame::new(), cancel, ended: false }));
     }
     UrlSource::open(url, kind, cancel).map(|s| Box::new(s) as Box<dyn Source>)
@@ -155,7 +162,8 @@ pub fn open_url(url: &str, kind: VideoStreamKind, cancel: Cancel) -> Result<Box<
 
 /// Raw pictures from an RTSP camera, as they came.
 pub struct RawRtspSource {
-    session: rtsp::Session,
+    /// None when only described.
+    session: Option<rtsp::Session>,
     layout: Layout,
     fps: f64,
     picture: Frame,
@@ -168,7 +176,7 @@ impl Source for RawRtspSource {
         if self.ended {
             return None;
         }
-        let data = match self.session.read(&self.cancel) {
+        let data = match self.session.as_mut()?.read(&self.cancel) {
             Ok(data) => data,
             Err(why) => {
                 tracing::debug!("stream ended: {why}");
@@ -187,6 +195,10 @@ impl Source for RawRtspSource {
 
     fn stated_fps(&self) -> f64 {
         self.fps
+    }
+
+    fn described_size(&self) -> Option<(u32, u32)> {
+        self.session.is_none().then_some((self.layout.width, self.layout.height))
     }
 }
 

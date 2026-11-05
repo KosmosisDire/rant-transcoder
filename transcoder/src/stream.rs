@@ -40,8 +40,9 @@ pub struct Parent {
 
 /// How often a topic nobody watches is measured again, which only a size change needs.
 const REMEASURE_TOPIC: Duration = Duration::from_secs(60);
-/// How often a URL with no shape yet is tried, each a connection to its server.
-const RETRY_URL: Duration = Duration::from_secs(30);
+/// How long after each measure of a URL that found nothing the next is tried, each a connection
+/// to its server. The last gap repeats.
+const RETRY_URL: [Duration; 5] = [Duration::from_secs(30), Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(300), Duration::from_secs(600)];
 /// How soon a viewer asking for a child that is not there brings another measure of a topic.
 const ASKED_AGAIN: Duration = Duration::from_secs(5);
 /// A source that ends sooner than this waits as long before it opens again.
@@ -64,7 +65,7 @@ fn absolute(name: &str) -> String {
 }
 
 /// What the source measured, which decides the children.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Shape {
     width: u32,
     height: u32,
@@ -95,6 +96,8 @@ pub(crate) struct Shared {
     /// Children whose publisher was refused, said once.
     refused: [bool; KINDS],
     shape: Option<Shape>,
+    /// What the descriptor states of its stream, in full or not at all.
+    stated: Option<Shape>,
     url: String,
     kind: VideoStreamKind,
 }
@@ -128,6 +131,12 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// The children made now, for the log.
+    fn said(&self) -> String {
+        let made: Vec<&str> = Kind::ALL.iter().filter(|&&k| self.children[k as usize].is_some()).map(|k| &k.suffix()[1..]).collect();
+        if made.is_empty() { "nothing to republish".to_owned() } else { format!("republished as {}", made.join(", ")) }
     }
 
     fn needs(&self, origin: Origin, k: Kind) -> bool {
@@ -185,14 +194,14 @@ pub struct Stream {
     last_wanted: Instant,
     last_probe: Option<Instant>,
     next_probe: Instant,
-    /// A viewer asks for a child that is not there.
-    asked: bool,
+    /// Measures of the URL that found nothing since it was set.
+    misses: usize,
 }
 
 impl Stream {
     /// `taken` says which of its children another node publishes already.
     pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, locals: Locals, workers: Arc<()>, taken: [bool; KINDS]) -> Stream {
-        let shared = Shared { children: Default::default(), taken, refused: [false; KINDS], shape: None, url: String::new(), kind: VideoStreamKind::Rtsp };
+        let shared = Shared { children: Default::default(), taken, refused: [false; KINDS], shape: None, stated: None, url: String::new(), kind: VideoStreamKind::Rtsp };
         let mut s = Stream {
             node,
             skip: !Kind::ALL.iter().any(|&k| name_fits(&parent.name, k)),
@@ -209,7 +218,7 @@ impl Stream {
             last_wanted: Instant::now(),
             last_probe: None,
             next_probe: Instant::now(),
-            asked: false,
+            misses: 0,
         };
         if s.skip {
             info!("{}: the name is too long to add a child, skipped", s.parent.name);
@@ -251,13 +260,14 @@ impl Stream {
         }
     }
 
-    /// A viewer asks for a child that is not there: the source may have changed, so measure it.
+    /// A viewer asks for a child that is not there: a topic may have changed, so measure it. A
+    /// URL's measure is a connection, and its shape holds until its URL changes.
     pub fn asked(&mut self) {
-        // a viewer may ask for good for a child its source never needs, and a URL's measure is a connection
-        let gap = if self.parent.origin.external() { RETRY_URL } else { ASKED_AGAIN };
-        let again = self.last_probe.map_or_else(Instant::now, |at| at + gap);
+        if self.parent.origin.external() {
+            return;
+        }
+        let again = self.last_probe.map_or_else(Instant::now, |at| at + ASKED_AGAIN);
         self.next_probe = self.next_probe.min(again);
-        self.asked = true;
     }
 
     /// A thread of this stream has been at one step for longer than the limit.
@@ -279,7 +289,14 @@ impl Stream {
         let generation = self.flags.generation.load(Ordering::Relaxed);
         if generation != self.seen_generation {
             self.seen_generation = generation;
-            self.next_probe = now; // a new URL is probed at once
+            // a new URL is measured at once, unless its descriptor says all
+            self.next_probe = now;
+            self.misses = 0;
+            let mut s = lock(&self.shared);
+            s.reconcile(&self.node, &self.parent);
+            if let Some(Shape { width, height, coding, .. }) = s.stated {
+                info!("{}: {width}x{height} {coding:?} as its descriptor says, {}", self.parent.name, s.said());
+            }
         }
         for k in Kind::ALL {
             let i = k as usize;
@@ -299,10 +316,11 @@ impl Stream {
         if self.worker.is_none() {
             if wanted && openable {
                 self.start(false);
-            } else if openable && now >= self.next_probe && (!external || !shaped || self.asked) {
+            } else if openable && now >= self.next_probe && (!external || !shaped) {
+                let gap = RETRY_URL[self.misses.min(RETRY_URL.len() - 1)];
+                self.misses += 1;
                 self.last_probe = Some(now);
-                self.next_probe = now + if external { RETRY_URL } else { REMEASURE_TOPIC };
-                self.asked = false;
+                self.next_probe = now + if external { gap } else { REMEASURE_TOPIC };
                 self.start(true);
             }
         } else if !wanted && !self.flags.probing.load(Ordering::Relaxed) && now - self.last_wanted > Duration::from_secs(2) {
@@ -345,13 +363,27 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 fn set_descriptor(shared: &Mutex<Shared>, flags: &Flags, d: &ExternalVideoStream) {
     let mut s = lock(shared);
     let url = d.url.value.as_str();
-    if s.url == url && s.kind == d.kind {
+    let stated = stated_shape(d);
+    if s.url == url && s.kind == d.kind && s.stated == stated {
         return;
     }
     s.url = url.to_owned();
     s.kind = d.kind;
-    s.shape = None; // another stream: measure it again
+    s.stated = stated;
+    s.shape = stated; // another stream: what its descriptor leaves out is measured again
     flags.generation.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The shape a descriptor states in full, which needs no measure. Its codec cannot say raw.
+fn stated_shape(d: &ExternalVideoStream) -> Option<Shape> {
+    let coding = match d.codec {
+        VideoCodec::Unknown => return None,
+        VideoCodec::H264 => Coding::H264,
+        VideoCodec::Mjpeg => Coding::Mjpeg,
+        _ => Coding::Other,
+    };
+    let sized = |v: u32| v > 0 && v <= SIDE_MAX;
+    (sized(d.width) && sized(d.height)).then_some(Shape { width: d.width, height: d.height, fps: 0.0, coding })
 }
 
 /// The children's encoders, started when a picture first comes for them, and the buffers of
@@ -442,6 +474,15 @@ impl Worker {
                 decoded_size = false;
                 match self.open(&mut generation) {
                     Ok(s) => {
+                        // a source that told its shape without playing is measured, and plays only for a viewer
+                        if let Some((w, h)) = s.described_size() {
+                            self.measured(w, h, s.stated_fps(), Coding::Raw);
+                            self.flags.probing.store(false, Ordering::Relaxed);
+                            if lock(&self.shared).matches() == [0; KINDS] {
+                                break;
+                            }
+                            continue;
+                        }
                         params = s.parameters();
                         stated_fps = s.stated_fps();
                         src = Some(s);
@@ -574,7 +615,7 @@ impl Worker {
         }
         let (flags, at) = (self.flags.clone(), *generation);
         let cancel: Cancel = Arc::new(move || flags.stop.load(Ordering::Relaxed) || flags.generation.load(Ordering::Relaxed) != at);
-        open_url(&url, kind, cancel)
+        open_url(&url, kind, cancel, !self.flags.probing.load(Ordering::Relaxed))
     }
 
     /// Hands one picture to the children that take it, each encoding it on its own thread.
@@ -620,9 +661,7 @@ impl Worker {
         if !changed {
             return;
         }
-        let made: Vec<&str> = Kind::ALL.iter().filter(|&&k| s.children[k as usize].is_some()).map(|k| &k.suffix()[1..]).collect();
-        let children = if made.is_empty() { "nothing to republish".to_owned() } else { format!("republished as {}", made.join(", ")) };
-        info!("{}: {width}x{height} at {fps:.1} fps {coding:?}, {children}", self.parent.name);
+        info!("{}: {width}x{height} at {fps:.1} fps {coding:?}, {}", self.parent.name, s.said());
     }
 }
 

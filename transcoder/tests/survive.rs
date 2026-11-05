@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use common::{DOMAIN, LOOPBACK, Reader, Viewer, ffmpeg, local};
 use rant::types::{ExternalVideoStream, Image, ImageFormat, Timestamp, Uri, VideoCodec, VideoFrame, VideoStreamKind};
-use rant::{Node, Publisher, Qos, VariableDefinition, VariableOptions};
+use rant::{EntityKind, Node, Publisher, Qos, VariableDefinition, VariableOptions};
 use rant_transcoder::av::Input;
 use rant_transcoder::rules::{needs_preview, video_size};
 use rant_transcoder::source::wall_us;
@@ -240,6 +240,18 @@ fn stream(url: &str, kind: VideoStreamKind) -> ExternalVideoStream {
 
 fn stream_variable(node: &Node, name: &str, url: &str, kind: VideoStreamKind) -> VariableDefinition<ExternalVideoStream> {
     node.variable_definition::<ExternalVideoStream>(name, VariableOptions::new().initial(stream(url, kind))).unwrap()
+}
+
+/// Waits for these topics to have a provider, failing when they do not soon. It asks a node that
+/// fetches every peer's entities, since one that subscribes to nothing sees none.
+fn provided_soon(names: &[&str]) {
+    let observer = Node::new("observer", local().fetch_details(true)).unwrap();
+    let from = Instant::now();
+    while names.iter().any(|n| observer.reflection().find(EntityKind::Topic, n).is_none_or(|e| e.providers == 0)) {
+        assert!(from.elapsed() < SOON, "{names:?} not all provided within {SOON:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("{names:?} provided in {:?}", from.elapsed());
 }
 
 /// How long until pictures come, failing with `what` when they do not come soon.
@@ -1353,6 +1365,7 @@ fn depth(n: u16) -> Vec<u8> {
 struct DepthCamera {
     port: u16,
     stop: Arc<AtomicBool>,
+    setups: Arc<AtomicUsize>,
     playing: Arc<AtomicUsize>,
     goodbyes: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
@@ -1364,8 +1377,8 @@ impl DepthCamera {
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (stop, playing, goodbyes) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let held = Arc::new(AtomicBool::new(false));
-        let (stopped, pl, g) = (stop.clone(), playing.clone(), goodbyes.clone());
+        let (held, setups) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+        let (stopped, pl, g, su) = (stop.clone(), playing.clone(), goodbyes.clone(), setups.clone());
         let thread = std::thread::spawn(move || {
             let mut conns = Vec::new();
             while !stopped.load(Ordering::Relaxed) {
@@ -1373,14 +1386,14 @@ impl DepthCamera {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let session = DepthSession { stop: stopped.clone(), held: held.clone(), playing: pl.clone(), goodbyes: g.clone() };
+                let session = DepthSession { stop: stopped.clone(), held: held.clone(), setups: su.clone(), playing: pl.clone(), goodbyes: g.clone() };
                 conns.push(std::thread::spawn(move || session.serve(c)));
             }
             for c in conns {
                 let _ = c.join();
             }
         });
-        DepthCamera { port, stop, playing, goodbyes, thread: Some(thread) }
+        DepthCamera { port, stop, setups, playing, goodbyes, thread: Some(thread) }
     }
 
     fn url(&self) -> String {
@@ -1405,6 +1418,7 @@ struct DepthSession {
     stop: Arc<AtomicBool>,
     /// A session holds the camera.
     held: Arc<AtomicBool>,
+    setups: Arc<AtomicUsize>,
     playing: Arc<AtomicUsize>,
     goodbyes: Arc<AtomicUsize>,
 }
@@ -1432,6 +1446,7 @@ impl DepthSession {
                     "SETUP" if owner || self.held.swap(true, Ordering::Relaxed) => format!("RTSP/1.0 503 Service Unavailable\r\nCSeq: {cseq}\r\n\r\n"),
                     "SETUP" => {
                         owner = true;
+                        self.setups.fetch_add(1, Ordering::Relaxed);
                         client = text.split("client_port=").nth(1).and_then(|p| p.split(['-', ';', '\r']).next()).and_then(|p| p.parse().ok()).unwrap_or(0);
                         format!("{ok}Transport: RTP/AVP;unicast;client_port={client}-{};server_port=9-10;ssrc=0BADCAFE\r\nSession: 7;timeout=60\r\n\r\n", client + 1)
                     }
@@ -1542,10 +1557,15 @@ fn depth_comes_through_exact_and_frees_the_camera() {
     let _stream = stream_variable(&node, "Test/Depth", &camera.url(), VideoStreamKind::Rtsp);
     let viewer = Viewer::watch(&[]);
 
+    // measured from its SDP alone: the children come before anyone watches, with no session
+    provided_soon(&["Test/Depth/Video", "Test/Depth/Mjpeg", "Test/Depth/Image"]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(camera.setups.load(Ordering::Relaxed), 0, "a session while nobody watches");
+
     let mut images = viewer.node().pulled_subscriber::<Image>("Test/Depth/Image", Qos::new().queue_bytes(16 << 20)).unwrap();
     let (from, mut exact) = (Instant::now(), 0);
     while exact < 10 {
-        assert!(from.elapsed() < SOON * 2, "{exact} depth pictures within {:?}", from.elapsed());
+        assert!(from.elapsed() < SOON, "{exact} depth pictures within {:?}", from.elapsed());
         let Ok(Some(m)) = images.take(Duration::from_millis(100)) else { continue };
         assert_eq!((m.width, m.height, m.format), (DEPTH_WIDTH as u32, DEPTH_HEIGHT as u32, ImageFormat::Mono16));
         let n = u16::from_le_bytes([m.data[0], m.data[1]]);
@@ -1567,6 +1587,21 @@ fn depth_comes_through_exact_and_frees_the_camera() {
     camera.settles_at(1, "for the second viewer");
     drop(video);
     camera.settles_at(0, "at the end");
+    service.alive();
+}
+
+#[test]
+fn a_stated_shape_needs_no_connection() {
+    let _turn = turn();
+    let clips = Clips::new();
+    let server = JpegServer::start(0, clips.picture("jpg", 320, 240), 0);
+    let mut service = Service::start();
+    let node = Node::new("cam", local()).unwrap();
+    let stated = ExternalVideoStream { width: 1920, height: 1080, codec: VideoCodec::Mjpeg, ..stream(&server.url(), VideoStreamKind::HttpMjpeg) };
+    let _stream = node.variable_definition::<ExternalVideoStream>("Test/Stated", VariableOptions::new().initial(stated)).unwrap();
+    provided_soon(&["Test/Stated/Preview", "Test/Stated/MjpegPreview"]);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(server.accepted.load(Ordering::Relaxed), 0, "connected to a URL whose descriptor says all");
     service.alive();
 }
 
