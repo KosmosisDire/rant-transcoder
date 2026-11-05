@@ -446,8 +446,8 @@ dependencies = [
 
 [[package]]
 name = "rant-macros"
-version = "0.0.41"
-source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.41#19ff8918736bd21ee43e6d517cd12101075bef8f"
+version = "0.0.42"
+source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.42#64c21f4e302c9054f72e505472965c9a9000bfb8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -456,8 +456,8 @@ dependencies = [
 
 [[package]]
 name = "rant-middleware"
-version = "0.0.41"
-source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.41#19ff8918736bd21ee43e6d517cd12101075bef8f"
+version = "0.0.42"
+source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.42#64c21f4e302c9054f72e505472965c9a9000bfb8"
 dependencies = [
  "cc",
  "rant-macros",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "rant-transcoder"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -489,8 +489,8 @@ dependencies = [
 
 [[package]]
 name = "rant-types"
-version = "0.0.41"
-source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.41#19ff8918736bd21ee43e6d517cd12101075bef8f"
+version = "0.0.42"
+source = "git+https://github.com/KosmosisDire/Rant.git?tag=crate-v0.0.42#64c21f4e302c9054f72e505472965c9a9000bfb8"
 
 [[package]]
 name = "regex"
