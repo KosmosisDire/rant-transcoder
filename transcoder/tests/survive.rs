@@ -1605,6 +1605,25 @@ fn a_stated_shape_needs_no_connection() {
     service.alive();
 }
 
+#[test]
+fn a_new_viewer_brings_a_url_down_at_first_at_once() {
+    let _turn = turn();
+    let clips = Clips::new();
+    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+    let mut service = Service::start();
+    let node = Node::new("cam", local()).unwrap();
+    let _stream = stream_variable(&node, "Test/Late", &format!("rtsp://127.0.0.1:{port}/cam"), VideoStreamKind::Rtsp);
+    // long enough for the first measure to find nothing, which puts the next 30 s away
+    std::thread::sleep(Duration::from_secs(4));
+    let _camera = RtspCamera::start(port, Arc::new(clips.h264(1290, 730)));
+    let viewer = Viewer::watch(&[]);
+    let preview = viewer.read("Test/Late/Preview");
+    let took = preview.plays(5, Duration::from_secs(40)).expect("the preview plays");
+    assert!(took < SOON, "the preview took {took:?} for a new viewer");
+    println!("the preview played {took:?} after its viewer came");
+    service.alive();
+}
+
 /// Cameras and viewers coming and going for a while: nothing may grow. Run on demand with
 /// `cargo test --release --test survive churn -- --ignored --nocapture`.
 #[test]

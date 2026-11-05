@@ -45,6 +45,10 @@ const REMEASURE_TOPIC: Duration = Duration::from_secs(60);
 const RETRY_URL: [Duration; 5] = [Duration::from_secs(30), Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(300), Duration::from_secs(600)];
 /// How soon a viewer asking for a child that is not there brings another measure of a topic.
 const ASKED_AGAIN: Duration = Duration::from_secs(5);
+/// How often a URL with no shape yet is tried while a viewer asks for a child it may need.
+const ASKED_URL: Duration = Duration::from_secs(30);
+/// The scan says who asks at least this often, so a longer silence means the viewer went.
+const STILL_ASKING: Duration = Duration::from_secs(5);
 /// A source that ends sooner than this waits as long before it opens again.
 const SHORTEST_LIFE: Duration = Duration::from_secs(2);
 /// An encoder nobody has fed for this long closes, since a GeForce counts its sessions.
@@ -196,6 +200,8 @@ pub struct Stream {
     next_probe: Instant,
     /// Measures of the URL that found nothing since it was set.
     misses: usize,
+    /// When the scan last said a viewer asks for a child that is not there.
+    last_asked: Option<Instant>,
 }
 
 impl Stream {
@@ -219,6 +225,7 @@ impl Stream {
             last_probe: None,
             next_probe: Instant::now(),
             misses: 0,
+            last_asked: None,
         };
         if s.skip {
             info!("{}: the name is too long to add a child, skipped", s.parent.name);
@@ -261,12 +268,20 @@ impl Stream {
     }
 
     /// A viewer asks for a child that is not there: a topic may have changed, so measure it. A
-    /// URL's measure is a connection, and its shape holds until its URL changes.
+    /// URL's measure is a connection, so a measured one holds its shape until its URL changes, and
+    /// one not measured yet is tried at once for a new viewer, then every 30 s while it asks.
     pub fn asked(&mut self) {
-        if self.parent.origin.external() {
+        let now = Instant::now();
+        let again = if !self.parent.origin.external() {
+            self.last_probe.map_or(now, |at| at + ASKED_AGAIN)
+        } else if lock(&self.shared).shape.is_some() {
             return;
-        }
-        let again = self.last_probe.map_or_else(Instant::now, |at| at + ASKED_AGAIN);
+        } else if self.last_asked.is_none_or(|at| now - at > STILL_ASKING) {
+            now
+        } else {
+            self.last_probe.map_or(now, |at| at + ASKED_URL)
+        };
+        self.last_asked = Some(now);
         self.next_probe = self.next_probe.min(again);
     }
 
