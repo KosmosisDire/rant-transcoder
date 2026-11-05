@@ -6,14 +6,14 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rant::types::{ExternalVideoStream, Timestamp, VideoCodec, VideoFrame, VideoStreamKind};
+use rant::types::{ExternalVideoStream, Image, Timestamp, VideoCodec, VideoFrame, VideoStreamKind};
 use rant::{Node, Publisher, Qos, RemoteVariable, Subscriber, VariableOptions};
 use tracing::{info, warn};
 
 use crate::av::{Cancel, CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
 use crate::child::{Child, Job};
-use crate::rules::{Busy, Coding, Kind, RateMeter, SIDE_MAX, name_fits, needs_child};
-use crate::source::{Locals, Payload, Source, TopicSource, UrlSource};
+use crate::rules::{Busy, Coding, KINDS, Kind, RateMeter, SIDE_MAX, name_fits, needs_child};
+use crate::source::{Locals, Payload, Source, TopicSource, UrlSource, image_format};
 
 /// What a parent carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,8 +49,8 @@ const SHORTEST_LIFE: Duration = Duration::from_secs(2);
 /// An encoder nobody has fed for this long closes, since a GeForce counts its sessions.
 const CHILD_IDLE: Duration = Duration::from_secs(5);
 
-/// The worker's place among a stream's busy marks, after the four children's.
-const WORKER: usize = 4;
+/// The worker's place among a stream's busy marks, after the children's.
+const WORKER: usize = KINDS;
 
 /// Milliseconds on a clock that only rises.
 pub(crate) fn clock_ms() -> u64 {
@@ -72,21 +72,36 @@ struct Shape {
     coding: Coding,
 }
 
+/// A child's publisher: encoded video, or the source's own pictures.
+enum Out {
+    Video(Publisher<VideoFrame>),
+    Image(Publisher<Image>),
+}
+
+impl Out {
+    fn match_count(&self) -> usize {
+        match self {
+            Out::Video(p) => p.match_count(),
+            Out::Image(p) => p.match_count(),
+        }
+    }
+}
+
 /// What the main loop, the worker and the children share.
 pub(crate) struct Shared {
-    children: [Option<Publisher<VideoFrame>>; 4],
+    children: [Option<Out>; KINDS],
     /// Children another node publishes, left to it.
-    taken: [bool; 4],
+    taken: [bool; KINDS],
     /// Children whose publisher was refused, said once.
-    refused: [bool; 4],
+    refused: [bool; KINDS],
     shape: Option<Shape>,
     url: String,
     kind: VideoStreamKind,
 }
 
 impl Shared {
-    fn matches(&self) -> [usize; 4] {
-        Kind::ALL.map(|k| self.children[k as usize].as_ref().map_or(0, Publisher::match_count))
+    fn matches(&self) -> [usize; KINDS] {
+        Kind::ALL.map(|k| self.children[k as usize].as_ref().map_or(0, Out::match_count))
     }
 
     /// Makes or drops each child's publisher to match what is known of the source.
@@ -101,7 +116,9 @@ impl Shared {
                 self.children[i] = None;
                 continue;
             }
-            match node.publisher::<VideoFrame>(&absolute(&format!("{}{}", parent.name, k.suffix())), Qos::new()) {
+            let name = absolute(&format!("{}{}", parent.name, k.suffix()));
+            let made = if k.is_encoded() { node.publisher::<VideoFrame>(&name, Qos::new()).map(Out::Video) } else { node.publisher::<Image>(&name, Qos::new()).map(Out::Image) };
+            match made {
                 Ok(p) => (self.children[i], self.refused[i]) = (Some(p), false),
                 Err(e) => {
                     if !self.refused[i] {
@@ -118,7 +135,7 @@ impl Shared {
             Some(s) => needs_child(k, s.coding, !origin.external(), s.width, s.height),
             // before a measure: pictures always change on the way to Video, a URL's first copy
             // brings it onto the mesh, a VideoFrame topic waits for its codec
-            None => (origin == Origin::Image && k == Kind::Video) || (origin.external() && !k.is_preview()),
+            None => (origin == Origin::Image && k == Kind::Video) || (origin.external() && matches!(k, Kind::Video | Kind::Mjpeg)),
         }
     }
 }
@@ -129,11 +146,11 @@ pub(crate) struct Flags {
     stop: AtomicBool,
     probing: AtomicBool,
     /// A new viewer starts on a keyframe.
-    keys: [AtomicBool; 4],
+    keys: [AtomicBool; KINDS],
     /// Bumps with every new URL, which the worker reopens and the probe measures.
     generation: AtomicU32,
     /// The worker's step of work and each child's encode.
-    pub(crate) working: [Busy; 5],
+    pub(crate) working: [Busy; KINDS + 1],
 }
 
 impl Flags {
@@ -163,7 +180,7 @@ pub struct Stream {
     flags: Arc<Flags>,
     _descriptor: Option<Descriptor>,
     worker: Option<JoinHandle<()>>,
-    seen: [usize; 4],
+    seen: [usize; KINDS],
     seen_generation: u32,
     last_wanted: Instant,
     last_probe: Option<Instant>,
@@ -174,8 +191,8 @@ pub struct Stream {
 
 impl Stream {
     /// `taken` says which of its children another node publishes already.
-    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, locals: Locals, workers: Arc<()>, taken: [bool; 4]) -> Stream {
-        let shared = Shared { children: Default::default(), taken, refused: [false; 4], shape: None, url: String::new(), kind: VideoStreamKind::Rtsp };
+    pub fn new(node: Arc<Node>, parent: Parent, encoder: Option<String>, locals: Locals, workers: Arc<()>, taken: [bool; KINDS]) -> Stream {
+        let shared = Shared { children: Default::default(), taken, refused: [false; KINDS], shape: None, url: String::new(), kind: VideoStreamKind::Rtsp };
         let mut s = Stream {
             node,
             skip: !Kind::ALL.iter().any(|&k| name_fits(&parent.name, k)),
@@ -187,7 +204,7 @@ impl Stream {
             flags: Arc::default(),
             _descriptor: None,
             worker: None,
-            seen: [0; 4],
+            seen: [0; KINDS],
             seen_generation: 0,
             last_wanted: Instant::now(),
             last_probe: None,
@@ -226,7 +243,7 @@ impl Stream {
     }
 
     /// Says which of its children another node publishes, whose names it leaves to them.
-    pub fn set_taken(&mut self, taken: [bool; 4]) {
+    pub fn set_taken(&mut self, taken: [bool; KINDS]) {
         let mut s = lock(&self.shared);
         if s.taken != taken {
             s.taken = taken;
@@ -305,6 +322,7 @@ impl Stream {
             shared: self.shared.clone(),
             flags: self.flags.clone(),
             out: VideoFrame::default(),
+            image: Image::default(),
             _counted: self.workers.clone(),
         };
         self.worker = Some(std::thread::spawn(move || w.run()));
@@ -340,13 +358,13 @@ fn set_descriptor(shared: &Mutex<Shared>, flags: &Flags, d: &ExternalVideoStream
 /// the pictures handed to them.
 #[derive(Default)]
 struct Children {
-    encoders: [Option<Child>; 4],
+    encoders: [Option<Child>; KINDS],
     pool: Pool,
 }
 
 impl Children {
     /// Closes each encoder nobody watches any more, so its session is free for another.
-    fn close_idle(&mut self, wanted: [bool; 4]) {
+    fn close_idle(&mut self, wanted: [bool; KINDS]) {
         for k in Kind::ALL {
             let slot = &mut self.encoders[k as usize];
             if !wanted[k as usize] && slot.as_ref().is_some_and(|c| c.idle() > CHILD_IDLE) {
@@ -364,8 +382,9 @@ struct Worker {
     locals: Locals,
     shared: Arc<Mutex<Shared>>,
     flags: Arc<Flags>,
-    /// The reused outgoing message.
+    /// The reused outgoing messages.
     out: VideoFrame,
+    image: Image,
     _counted: Arc<()>,
 }
 
@@ -404,7 +423,7 @@ impl Worker {
                         self.measured(width, height, rate(&meter, stated_fps), coding);
                     }
                     self.flags.probing.store(false, Ordering::Relaxed);
-                    if lock(&self.shared).matches() == [0; 4] {
+                    if lock(&self.shared).matches() == [0; KINDS] {
                         break;
                     }
                 }
@@ -446,7 +465,7 @@ impl Worker {
             let Some(u) = src.as_mut().and_then(|s| s.read(Duration::from_millis(200))) else { continue };
             meter.add(u.time_us);
             let (w, h) = match &u.payload {
-                Payload::Picture(p) => (p.width(), p.height()),
+                Payload::Picture { picture, .. } => (picture.width(), picture.height()),
                 Payload::Coded { .. } => (u.width, u.height),
             };
             let stated = w > 0 && h > 0 && w <= SIDE_MAX && h <= SIDE_MAX;
@@ -457,11 +476,14 @@ impl Worker {
             let wanted = lock(&self.shared).matches().map(|m| m > 0);
 
             match u.payload {
-                Payload::Picture(p) => {
+                Payload::Picture { picture, data, stride } => {
                     coding = Coding::Raw;
                     decoded_size = false;
+                    if external && wanted[Kind::Image as usize] {
+                        self.publish_image(&picture, data, stride, u.time_us);
+                    }
                     if wanted.contains(&true) {
-                        self.feed(&mut children, &p, wanted, fps, u.time_us);
+                        self.feed(&mut children, &picture, wanted, fps, u.time_us);
                     }
                 }
                 Payload::Coded { codec, data, key } => {
@@ -556,7 +578,7 @@ impl Worker {
     }
 
     /// Hands one picture to the children that take it, each encoding it on its own thread.
-    fn feed(&self, children: &mut Children, picture: &Frame, wanted: [bool; 4], fps: f64, time_us: u64) {
+    fn feed(&self, children: &mut Children, picture: &Frame, wanted: [bool; KINDS], fps: f64, time_us: u64) {
         // the children read it after the source has moved on, so it needs a frame of its own
         let Some(picture) = children.pool.own(picture).map(|f| Arc::new(Picture::new(f))) else { return };
         for k in Kind::ALL {
@@ -565,7 +587,7 @@ impl Worker {
                 warn!("{}{}: its encoder thread died, starting another", self.parent.name, k.suffix());
                 *slot = None;
             }
-            if wanted[k as usize] {
+            if wanted[k as usize] && k.is_encoded() {
                 let c = slot.get_or_insert_with(|| Child::start(&self.parent.name, k, self.encoder.clone(), self.shared.clone(), self.flags.clone()));
                 c.give(Job { picture: picture.clone(), time_us, fps });
             }
@@ -574,6 +596,19 @@ impl Worker {
 
     fn publish(&mut self, kind: Kind, data: &[u8], key: bool, width: u32, height: u32, time_us: u64) {
         publish(&self.shared, &mut self.out, kind, data, key, width, height, time_us);
+    }
+
+    /// Sends a URL's raw picture on its Image child, byte for byte as it came.
+    fn publish_image(&mut self, picture: &Frame, data: &[u8], stride: u32, time_us: u64) {
+        let Some(format) = image_format(picture.format()) else { return };
+        let m = &mut self.image;
+        (m.width, m.height, m.stride, m.format) = (picture.width(), picture.height(), stride, format);
+        m.data.clear();
+        m.data.extend_from_slice(data);
+        let s = lock(&self.shared);
+        if let Some(Out::Image(p)) = s.children[Kind::Image as usize].as_ref().filter(|p| p.match_count() > 0) {
+            let _ = p.send_captured(m, Timestamp { us: time_us as i64 });
+        }
     }
 
     /// Records the source's shape and makes or drops the children it calls for.
@@ -610,7 +645,7 @@ pub(crate) fn publish(shared: &Mutex<Shared>, out: &mut VideoFrame, kind: Kind, 
     out.data.clear();
     out.data.extend_from_slice(data);
     let s = lock(shared);
-    if let Some(p) = s.children[kind as usize].as_ref().filter(|p| p.match_count() > 0) {
+    if let Some(Out::Video(p)) = s.children[kind as usize].as_ref().filter(|p| p.match_count() > 0) {
         let _ = p.send_captured(out, out.pts);
     }
 }

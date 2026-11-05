@@ -26,17 +26,22 @@ const NAME_MAX: usize = 64;
 /// A source's size past this is no real size: JPEG and H264 stop here.
 pub const SIDE_MAX: u32 = 65535;
 
-/// A stream's children: H264 and MJPEG, each at the source's size and as a smaller preview.
+/// A stream's children: H264 and MJPEG, each at the source's size and as a smaller preview, and
+/// a URL's raw pictures as they came.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Video,
     Preview,
     Mjpeg,
     MjpegPreview,
+    Image,
 }
 
+/// How many kinds of child a stream has.
+pub const KINDS: usize = 5;
+
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Video, Kind::Preview, Kind::Mjpeg, Kind::MjpegPreview];
+    pub const ALL: [Kind; KINDS] = [Kind::Video, Kind::Preview, Kind::Mjpeg, Kind::MjpegPreview, Kind::Image];
 
     pub fn suffix(self) -> &'static str {
         match self {
@@ -44,7 +49,13 @@ impl Kind {
             Kind::Preview => "/Preview",
             Kind::Mjpeg => "/Mjpeg",
             Kind::MjpegPreview => "/MjpegPreview",
+            Kind::Image => "/Image",
         }
+    }
+
+    /// The child is an encoder's output, not the source's own pixels.
+    pub fn is_encoded(self) -> bool {
+        self != Kind::Image
     }
 
     pub fn is_preview(self) -> bool {
@@ -59,6 +70,7 @@ impl Kind {
     pub fn size(self, width: u32, height: u32) -> (u32, u32) {
         match self {
             Kind::Video | Kind::Mjpeg => video_size(width, height),
+            Kind::Image => (width, height),
             Kind::Preview => preview_size(width, height),
             Kind::MjpegPreview => fit(width, height, MJPEG_PREVIEW_SIDE, MJPEG_PREVIEW_SIDE),
         }
@@ -84,6 +96,7 @@ pub enum Coding {
 /// does a preview the size of its source. `on_mesh` is false for a URL, which a copy brings there.
 pub fn needs_child(kind: Kind, coding: Coding, on_mesh: bool, width: u32, height: u32) -> bool {
     match kind {
+        Kind::Image => !on_mesh && coding == Coding::Raw,
         Kind::Video => !(on_mesh && coding == Coding::H264),
         Kind::Mjpeg => !(on_mesh && coding == Coding::Mjpeg),
         Kind::Preview => needs_preview(width, height),
@@ -278,6 +291,12 @@ mod tests {
         assert!(needs(Kind::MjpegPreview, Coding::H264, true, 360, 641));
         assert!(!needs(Kind::MjpegPreview, Coding::Raw, true, 640, 480));
         assert!(!needs(Kind::MjpegPreview, Coding::Raw, true, 360, 640));
+        // only a URL's raw pictures come onto the mesh as they are
+        assert!(needs(Kind::Image, Coding::Raw, false, 480, 270));
+        assert!(!needs(Kind::Image, Coding::Raw, true, 480, 270));
+        for coding in [Coding::H264, Coding::Mjpeg, Coding::Other] {
+            assert!(!needs(Kind::Image, coding, false, 480, 270));
+        }
     }
 
     #[test]

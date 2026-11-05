@@ -24,8 +24,8 @@ pub struct Unit<'a> {
 }
 
 pub enum Payload<'a> {
-    /// Wraps the message's bytes until the next read.
-    Picture(Wrapped<'a>),
+    /// Wraps the bytes until the next read, which `data` holds as they came.
+    Picture { picture: Wrapped<'a>, data: &'a [u8], stride: u32 },
     Coded { codec: CodecId, data: &'a [u8], key: bool },
 }
 
@@ -66,6 +66,11 @@ const RAW: [(ImageFormat, PixelFormat); 8] = [
     (ImageFormat::Nv12, PixelFormat::NV12),
     (ImageFormat::Monof32, PixelFormat::GRAYF32LE),
 ];
+
+/// Rant's name for a raw picture format.
+pub fn image_format(pixels: PixelFormat) -> Option<ImageFormat> {
+    RAW.iter().find(|(_, p)| *p == pixels).map(|(f, _)| *f)
+}
 
 /// An Image or VideoFrame topic, taking messages from this host's publishers only. An Image
 /// source reads the newest picture, a VideoFrame one every frame.
@@ -112,8 +117,9 @@ fn image<'a>(m: &MessageView<'a>, data: &'a [u8], width: u32, height: u32, pictu
         f if f == ImageFormat::Png as u64 => CodecId::PNG,
         _ => {
             let (_, pixels) = RAW.iter().find(|(f, _)| *f as u64 == format)?;
-            let layout = Layout { width, height, stride: m.get_uint("stride") as u32, format: *pixels };
-            return picture.wrap(data, layout).map(Payload::Picture);
+            let stride = m.get_uint("stride") as u32;
+            let layout = Layout { width, height, stride, format: *pixels };
+            return picture.wrap(data, layout).map(|picture| Payload::Picture { picture, data, stride });
         }
     };
     Some(Payload::Coded { codec, data, key: true })
