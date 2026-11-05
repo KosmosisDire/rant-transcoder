@@ -220,7 +220,7 @@ impl Drop for Pool {
 
 /// Raw pixels as a Rant Image lays them out: rows from the top, `stride` bytes apart or packed
 /// when 0, and NV12's chroma plane straight after its luma plane.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     pub width: u32,
     pub height: u32,

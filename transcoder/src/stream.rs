@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::av::{Cancel, CodecId, CodecParameters, Decoder, Frame, Picture, Pool};
 use crate::child::{Child, Job};
 use crate::rules::{Busy, Coding, KINDS, Kind, RateMeter, SIDE_MAX, name_fits, needs_child};
-use crate::source::{Locals, Payload, Source, TopicSource, UrlSource, image_format};
+use crate::source::{Locals, Payload, Source, TopicSource, image_format, open_url};
 
 /// What a parent carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -574,7 +574,7 @@ impl Worker {
         }
         let (flags, at) = (self.flags.clone(), *generation);
         let cancel: Cancel = Arc::new(move || flags.stop.load(Ordering::Relaxed) || flags.generation.load(Ordering::Relaxed) != at);
-        UrlSource::open(&url, kind, cancel).map(|s| Box::new(s) as Box<dyn Source>)
+        open_url(&url, kind, cancel)
     }
 
     /// Hands one picture to the children that take it, each encoding it on its own thread.

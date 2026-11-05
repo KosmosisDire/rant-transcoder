@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rant::types::{ImageFormat, VideoCodec, VideoStreamKind};
 use rant::{Bytes, MessageView, Node, Qos, Subscriber};
 
-use crate::annexb;
+use crate::{annexb, rtsp};
 use crate::av::{Cancel, CodecId, CodecParameters, Frame, Input, Layout, PixelFormat, Wrapped};
 
 /// This host's peers, which the mesh scan keeps up to date. Only their messages count.
@@ -139,6 +139,55 @@ fn video<'a>(m: &MessageView<'a>, data: &'a [u8]) -> Option<Payload<'a>> {
         _ => false,
     };
     Some(Payload::Coded { codec, data, key: m.get_bool("keyframe") || codec == CodecId::MJPEG || idr })
+}
+
+/// A URL's units: raw pictures in GStreamer's X-GST payload through this transcoder's own RTSP
+/// client, anything else through FFmpeg.
+pub fn open_url(url: &str, kind: VideoStreamKind, cancel: Cancel) -> Result<Box<dyn Source>, String> {
+    if kind == VideoStreamKind::Rtsp
+        && let Some(d) = rtsp::describe(url, &cancel)?
+    {
+        let session = rtsp::Session::open(url, &d, &cancel)?;
+        return Ok(Box::new(RawRtspSource { session, layout: d.layout, fps: d.fps, picture: Frame::new(), cancel, ended: false }));
+    }
+    UrlSource::open(url, kind, cancel).map(|s| Box::new(s) as Box<dyn Source>)
+}
+
+/// Raw pictures from an RTSP camera, as they came.
+pub struct RawRtspSource {
+    session: rtsp::Session,
+    layout: Layout,
+    fps: f64,
+    picture: Frame,
+    cancel: Cancel,
+    ended: bool,
+}
+
+impl Source for RawRtspSource {
+    fn read(&mut self, _timeout: Duration) -> Option<Unit<'_>> {
+        if self.ended {
+            return None;
+        }
+        let data = match self.session.read(&self.cancel) {
+            Ok(data) => data,
+            Err(why) => {
+                tracing::debug!("stream ended: {why}");
+                self.ended = true;
+                return None;
+            }
+        };
+        let layout = self.layout;
+        let picture = self.picture.wrap(data, layout)?;
+        Some(Unit { payload: Payload::Picture { picture, data, stride: layout.stride }, width: layout.width, height: layout.height, time_us: wall_us() })
+    }
+
+    fn ended(&self) -> bool {
+        self.ended
+    }
+
+    fn stated_fps(&self) -> f64 {
+        self.fps
+    }
 }
 
 /// An ExternalVideoStream's URL, demuxed by FFmpeg and paced to the stream's own clock.

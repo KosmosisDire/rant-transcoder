@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1186,19 +1186,19 @@ impl RtspCamera {
         self.hangs.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn playing(&self) -> usize {
-        self.playing.load(Ordering::Relaxed)
-    }
-
-    /// Waits for this many sessions, failing when they do not settle there.
     fn settles_at(&self, want: usize, what: &str) {
-        let from = Instant::now();
-        while self.playing() != want && from.elapsed() < SOON {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert_eq!(self.playing(), want, "RTSP sessions {what}");
-        println!("{want} RTSP sessions {what}, in {:?}", from.elapsed());
+        settles_at(&self.playing, want, what);
     }
+}
+
+/// Waits for a camera to have this many sessions, failing when they do not settle there.
+fn settles_at(playing: &AtomicUsize, want: usize, what: &str) {
+    let from = Instant::now();
+    while playing.load(Ordering::Relaxed) != want && from.elapsed() < SOON {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(playing.load(Ordering::Relaxed), want, "RTSP sessions {what}");
+    println!("{want} RTSP sessions {what}, in {:?}", from.elapsed());
 }
 
 impl Drop for RtspCamera {
@@ -1234,7 +1234,7 @@ impl RtspSession {
             }
             let mut said_bye = false;
             while let Some(request) = next_request(&mut pending) {
-                let (method, cseq) = request;
+                let (method, cseq, _) = request;
                 let answer = self.answer(&method, cseq, c.peer_addr().map(|a| a.port()).unwrap_or(0));
                 if c.write_all(answer.as_bytes()).is_err() {
                     said_bye = true;
@@ -1284,9 +1284,9 @@ impl RtspSession {
     }
 }
 
-/// Takes one request off the bytes received, skipping the player's interleaved RTCP. Its method
-/// and sequence number.
-fn next_request(pending: &mut Vec<u8>) -> Option<(String, u32)> {
+/// Takes one request off the bytes received, skipping the player's interleaved RTCP. Its method,
+/// sequence number and text.
+fn next_request(pending: &mut Vec<u8>) -> Option<(String, u32, String)> {
     loop {
         if pending.first() == Some(&b'$') {
             let length = 4 + u16::from_be_bytes([*pending.get(2)?, *pending.get(3)?]) as usize;
@@ -1301,7 +1301,7 @@ fn next_request(pending: &mut Vec<u8>) -> Option<(String, u32)> {
         pending.drain(..end);
         let method = text.split_whitespace().next()?.to_owned();
         let cseq = text.lines().find_map(|l| l.strip_prefix("CSeq:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
-        return Some((method, cseq));
+        return Some((method, cseq, text));
     }
 }
 
@@ -1338,6 +1338,154 @@ fn send_packet(c: &mut TcpStream, head: &[u8], body: &[u8], time: u32, marker: b
     p.extend_from_slice(body);
     *packets = packets.wrapping_add(1);
     c.write_all(&p)
+}
+
+const DEPTH_WIDTH: usize = 480;
+const DEPTH_HEIGHT: usize = 270;
+
+/// The depth picture numbered `n`: its first value is the number, the rest follow from it.
+fn depth(n: u16) -> Vec<u8> {
+    (0..DEPTH_WIDTH * DEPTH_HEIGHT).flat_map(|i| if i == 0 { n } else { (i as u16).wrapping_mul(7).wrapping_add(n) }.to_le_bytes()).collect()
+}
+
+/// A depth camera as the Kinova arm serves one: raw GRAY16_LE in GStreamer's X-GST packets over
+/// UDP, to one session at a time. Another gets 503 meanwhile, as from GStreamer's server.
+struct DepthCamera {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    playing: Arc<AtomicUsize>,
+    goodbyes: Arc<AtomicUsize>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DepthCamera {
+    fn start() -> DepthCamera {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, playing, goodbyes) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let held = Arc::new(AtomicBool::new(false));
+        let (stopped, pl, g) = (stop.clone(), playing.clone(), goodbyes.clone());
+        let thread = std::thread::spawn(move || {
+            let mut conns = Vec::new();
+            while !stopped.load(Ordering::Relaxed) {
+                let Ok((c, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let session = DepthSession { stop: stopped.clone(), held: held.clone(), playing: pl.clone(), goodbyes: g.clone() };
+                conns.push(std::thread::spawn(move || session.serve(c)));
+            }
+            for c in conns {
+                let _ = c.join();
+            }
+        });
+        DepthCamera { port, stop, playing, goodbyes, thread: Some(thread) }
+    }
+
+    fn url(&self) -> String {
+        format!("rtsp://127.0.0.1:{}/depth", self.port)
+    }
+
+    fn settles_at(&self, want: usize, what: &str) {
+        settles_at(&self.playing, want, what);
+    }
+}
+
+impl Drop for DepthCamera {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+struct DepthSession {
+    stop: Arc<AtomicBool>,
+    /// A session holds the camera.
+    held: Arc<AtomicBool>,
+    playing: Arc<AtomicUsize>,
+    goodbyes: Arc<AtomicUsize>,
+}
+
+impl DepthSession {
+    fn serve(&self, mut c: TcpStream) {
+        // the arm's own caps: GRAY16_LE at 480x270
+        const SDP: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=Session streamed with GStreamer\r\nt=0 0\r\na=control:*\r\nm=application 0 RTP/AVP 96\r\nc=IN IP4 0.0.0.0\r\na=rtpmap:96 X-GST/90000\r\na=framerate:30\r\na=fmtp:96 caps=dmlkZW8veC1yYXcsIHdpZHRoPShpbnQpNDgwLCBoZWlnaHQ9KGludCkyNzAsIGZyYW1lcmF0ZT0oZnJhY3Rpb24pMzAvMSwgcGl4ZWwtYXNwZWN0LXJhdGlvPShmcmFjdGlvbikxLzEsIGludGVybGFjZS1tb2RlPShzdHJpbmcpcHJvZ3Jlc3NpdmUsIGZvcm1hdD0oc3RyaW5nKUdSQVkxNl9MRQ==;capsversion=0\r\na=control:stream=0\r\n";
+        let _ = c.set_read_timeout(Some(Duration::from_millis(1)));
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (mut pending, mut chunk) = (Vec::new(), [0u8; 4096]);
+        let (mut owner, mut client, mut sending, mut n, mut packets, mut next) = (false, 0u16, false, 0u16, 0u16, Instant::now());
+        while !self.stop.load(Ordering::Relaxed) {
+            match c.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(k) => pending.extend_from_slice(&chunk[..k]),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(_) => break,
+            }
+            let mut bye = false;
+            while let Some((method, cseq, text)) = next_request(&mut pending) {
+                let ok = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n");
+                let answer = match method.as_str() {
+                    "DESCRIBE" => format!("{ok}Content-Base: rtsp://127.0.0.1/depth/\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{SDP}", SDP.len()),
+                    "SETUP" if owner || self.held.swap(true, Ordering::Relaxed) => format!("RTSP/1.0 503 Service Unavailable\r\nCSeq: {cseq}\r\n\r\n"),
+                    "SETUP" => {
+                        owner = true;
+                        client = text.split("client_port=").nth(1).and_then(|p| p.split(['-', ';', '\r']).next()).and_then(|p| p.parse().ok()).unwrap_or(0);
+                        format!("{ok}Transport: RTP/AVP;unicast;client_port={client}-{};server_port=9-10;ssrc=0BADCAFE\r\nSession: 7;timeout=60\r\n\r\n", client + 1)
+                    }
+                    "PLAY" if owner => {
+                        if !sending {
+                            self.playing.fetch_add(1, Ordering::Relaxed);
+                        }
+                        sending = true;
+                        format!("{ok}Session: 7\r\n\r\n")
+                    }
+                    "TEARDOWN" => {
+                        self.goodbyes.fetch_add(1, Ordering::Relaxed);
+                        bye = true;
+                        format!("{ok}Session: 7\r\n\r\n")
+                    }
+                    _ => format!("{ok}\r\n"),
+                };
+                if c.write_all(answer.as_bytes()).is_err() {
+                    bye = true;
+                }
+            }
+            if bye {
+                break;
+            }
+            if sending && Instant::now() >= next {
+                next += FRAME;
+                send_depth(&udp, client, n, &mut packets);
+                n = n.wrapping_add(1);
+            }
+        }
+        if sending {
+            self.playing.fetch_sub(1, Ordering::Relaxed);
+        }
+        if owner {
+            self.held.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Sends one depth picture as GStreamer's rtpgstpay does: fragments with their byte offset, the
+/// marker on the last.
+fn send_depth(udp: &UdpSocket, port: u16, n: u16, packets: &mut u16) {
+    let picture = depth(n);
+    for (i, part) in picture.chunks(1380).enumerate() {
+        let last = (i + 1) * 1380 >= picture.len();
+        let mut p = vec![0x80, 96 | (last as u8) << 7];
+        p.extend_from_slice(&packets.to_be_bytes());
+        p.extend_from_slice(&(n as u32 * 3000).to_be_bytes());
+        p.extend_from_slice(&[0x0b, 0xad, 0xca, 0xfe, 0, 0, 0, 0]);
+        p.extend_from_slice(&((i * 1380) as u32).to_be_bytes());
+        p.extend_from_slice(part);
+        let _ = udp.send_to(&p, (Ipv4Addr::LOCALHOST, port));
+        *packets = packets.wrapping_add(1);
+    }
 }
 
 #[test]
@@ -1380,6 +1528,43 @@ fn rtsp_sessions_close_and_come_back() {
     println!("played {:?} after the camera restarted", plays(&video, "the camera's restart"));
     camera.settles_at(1, "after the camera restarted");
 
+    drop(video);
+    camera.settles_at(0, "at the end");
+    service.alive();
+}
+
+#[test]
+fn depth_comes_through_exact_and_frees_the_camera() {
+    let _turn = turn();
+    let camera = DepthCamera::start();
+    let mut service = Service::start();
+    let node = Node::new("cam", local()).unwrap();
+    let _stream = stream_variable(&node, "Test/Depth", &camera.url(), VideoStreamKind::Rtsp);
+    let viewer = Viewer::watch(&[]);
+
+    let mut images = viewer.node().pulled_subscriber::<Image>("Test/Depth/Image", Qos::new().queue_bytes(16 << 20)).unwrap();
+    let (from, mut exact) = (Instant::now(), 0);
+    while exact < 10 {
+        assert!(from.elapsed() < SOON * 2, "{exact} depth pictures within {:?}", from.elapsed());
+        let Ok(Some(m)) = images.take(Duration::from_millis(100)) else { continue };
+        assert_eq!((m.width, m.height, m.format), (DEPTH_WIDTH as u32, DEPTH_HEIGHT as u32, ImageFormat::Mono16));
+        let n = u16::from_le_bytes([m.data[0], m.data[1]]);
+        assert!(m.data == depth(n), "depth picture {n} changed on the way");
+        exact += 1;
+    }
+    println!("{exact} exact depth pictures in {:?}", from.elapsed());
+    let (video, mjpeg) = (viewer.read("Test/Depth/Video"), viewer.read("Test/Depth/Mjpeg"));
+    for r in [&video, &mjpeg] {
+        println!("{} played in {:?}", r.name, plays(r, "a depth camera"));
+    }
+    camera.settles_at(1, "while watched");
+
+    drop((images, video, mjpeg));
+    camera.settles_at(0, "once nobody watches");
+    assert!(camera.goodbyes.load(Ordering::Relaxed) >= 1, "the closing session said no goodbye");
+    let video = viewer.read("Test/Depth/Video");
+    plays(&video, "a second viewer");
+    camera.settles_at(1, "for the second viewer");
     drop(video);
     camera.settles_at(0, "at the end");
     service.alive();

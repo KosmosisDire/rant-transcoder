@@ -5,6 +5,7 @@ pub mod annexb;
 pub mod av;
 mod child;
 pub mod hosts;
+pub mod rtsp;
 pub mod rules;
 pub mod source;
 pub mod stream;
