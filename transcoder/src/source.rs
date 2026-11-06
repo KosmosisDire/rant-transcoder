@@ -154,8 +154,9 @@ pub fn open_url(url: &str, kind: VideoStreamKind, cancel: Cancel, play: bool) ->
     if kind == VideoStreamKind::Rtsp
         && let Some(d) = rtsp::describe(url, &cancel)?
     {
-        let session = if play { Some(rtsp::Session::open(url, &d, &cancel)?) } else { None };
-        return Ok(Box::new(RawRtspSource { session, layout: d.layout, fps: d.fps, picture: Frame::new(), cancel, ended: false }));
+        let (layout, fps) = (d.stream.layout, d.stream.fps);
+        let session = if play { Some(rtsp::Session::open(d, &cancel)?) } else { None };
+        return Ok(Box::new(RawRtspSource { session, layout, fps, picture: Frame::new(), cancel, ended: false }));
     }
     UrlSource::open(url, kind, cancel).map(|s| Box::new(s) as Box<dyn Source>)
 }

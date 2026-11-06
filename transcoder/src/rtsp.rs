@@ -47,16 +47,23 @@ pub struct Description {
     pub fps: f64,
 }
 
+/// A described stream on the connection that asked, since a camera like the arm takes a SETUP
+/// only there. Dropping it just closes the connection.
+pub struct Described {
+    control: Control,
+    pub stream: Description,
+}
+
 /// Asks the camera what it serves. None when it is not raw pictures in X-GST, which FFmpeg reads,
 /// or when the URL has a login, which only FFmpeg's reader offers.
-pub fn describe(url: &str, cancel: &Cancel) -> Result<Option<Description>, String> {
-    let Some(mut c) = Control::connect(url)? else { return Ok(None) };
-    let a = c.ask("DESCRIBE", url, "Accept: application/sdp\r\n", Some(cancel), ANSWER)?;
+pub fn describe(url: &str, cancel: &Cancel) -> Result<Option<Described>, String> {
+    let Some(mut control) = Control::connect(url)? else { return Ok(None) };
+    let a = control.ask("DESCRIBE", url, "Accept: application/sdp\r\n", Some(cancel), ANSWER)?;
     if a.status != 200 {
         return Ok(None); // FFmpeg tells what is wrong
     }
     let base = a.header("content-base").or(a.header("content-location")).unwrap_or(url).to_owned();
-    Ok(parse_sdp(&a.body, &base))
+    Ok(parse_sdp(&a.body, &base).map(|stream| Described { control, stream }))
 }
 
 /// One playing session, which ends with a goodbye on drop.
@@ -75,8 +82,8 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn open(url: &str, d: &Description, cancel: &Cancel) -> Result<Session, String> {
-        let mut control = Control::connect(url)?.ok_or("the URL is not one this client takes")?;
+    pub fn open(described: Described, cancel: &Cancel) -> Result<Session, String> {
+        let Described { mut control, stream: d } = described;
         let (local, camera) = (control.tcp.local_addr().map_err(|e| e.to_string())?.ip(), control.tcp.peer_addr().map_err(|e| e.to_string())?.ip());
         let (rtp, rtcp) = udp_pair(local)?;
         let port = rtp.local_addr().map_err(|e| e.to_string())?.port();

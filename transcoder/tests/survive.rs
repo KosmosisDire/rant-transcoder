@@ -1361,7 +1361,8 @@ fn depth(n: u16) -> Vec<u8> {
 }
 
 /// A depth camera as the Kinova arm serves one: raw GRAY16_LE in GStreamer's X-GST packets over
-/// UDP, to one session at a time. Another gets 503 meanwhile, as from GStreamer's server.
+/// UDP, to one session at a time. Another gets 503 meanwhile, and so does a SETUP on a connection
+/// that did not DESCRIBE.
 struct DepthCamera {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -1430,7 +1431,7 @@ impl DepthSession {
         let _ = c.set_read_timeout(Some(Duration::from_millis(1)));
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (mut pending, mut chunk) = (Vec::new(), [0u8; 4096]);
-        let (mut owner, mut client, mut sending, mut n, mut packets, mut next) = (false, 0u16, false, 0u16, 0u16, Instant::now());
+        let (mut described, mut owner, mut client, mut sending, mut n, mut packets, mut next) = (false, false, 0u16, false, 0u16, 0u16, Instant::now());
         while !self.stop.load(Ordering::Relaxed) {
             match c.read(&mut chunk) {
                 Ok(0) => break,
@@ -1442,8 +1443,11 @@ impl DepthSession {
             while let Some((method, cseq, text)) = next_request(&mut pending) {
                 let ok = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n");
                 let answer = match method.as_str() {
-                    "DESCRIBE" => format!("{ok}Content-Base: rtsp://127.0.0.1/depth/\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{SDP}", SDP.len()),
-                    "SETUP" if owner || self.held.swap(true, Ordering::Relaxed) => format!("RTSP/1.0 503 Service Unavailable\r\nCSeq: {cseq}\r\n\r\n"),
+                    "DESCRIBE" => {
+                        described = true;
+                        format!("{ok}Content-Base: rtsp://127.0.0.1/depth/\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{SDP}", SDP.len())
+                    }
+                    "SETUP" if !described || owner || self.held.swap(true, Ordering::Relaxed) => format!("RTSP/1.0 503 Service Unavailable\r\nCSeq: {cseq}\r\n\r\n"),
                     "SETUP" => {
                         owner = true;
                         self.setups.fetch_add(1, Ordering::Relaxed);
