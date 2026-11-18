@@ -27,8 +27,9 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
         println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     }
-    // OUT_DIR is <profile>/build/<package>/out, and exes land in <profile>, deps and examples
-    let profile = out.ancestors().nth(3).expect("cargo's OUT_DIR layout");
+    // OUT_DIR lies under <profile>/build, at a depth that changed in Rust 1.100. Exes land in <profile>,
+    // examples and, before 1.100, deps. Cargo puts <profile> on the library path of the tests it runs.
+    let profile = out.ancestors().find(|p| p.ends_with("build")).and_then(Path::parent).expect("cargo's OUT_DIR layout");
     for exes in [profile.to_path_buf(), profile.join("deps"), profile.join("examples")] {
         place_runtime(&dir, &os, &exes).unwrap_or_else(|e| panic!("rant-transcoder: placing FFmpeg in {}: {e}", exes.display()));
     }
